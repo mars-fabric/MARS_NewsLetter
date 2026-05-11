@@ -1,0 +1,45 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# ── Env / secrets ────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+
+# ── Frontend ─────────────────────────────────────────────────────────────────
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# ── Logs and outputs ─────────────────────────────────────────────────────────
+*.log
+backend/logs/
+
+# Newsletter / cmbagent work directory (stage outputs, sessions, sqlite db).
+# Path is settable via NEWSLETTER_DEFAULT_WORK_DIR / NEXT_PUBLIC_CMBAGENT_WORK_DIR.
+cmbdir/
+cmbdir_*/
+backend/cmbdir/
+backend/cmbdir_*/
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Internal documentation (generated locally; not for git) ──────────────────
+doc/
+
+# ── Dev notes ────────────────────────────────────────────────────────────────
+prompt.md
