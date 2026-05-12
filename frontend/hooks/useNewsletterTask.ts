@@ -318,19 +318,6 @@ export function useNewsletterTask() {
     }
   }, [refreshTask, fetchStageContent, setError]);
 
-  const refineStage = useCallback(async (taskId: string, stageNum: number, message: string, content: string) => {
-    try {
-      const res = await apiJson<{ refined_content: string }>(`/api/newsletter/${taskId}/stages/${stageNum}/refine`, {
-        method: 'POST',
-        body: JSON.stringify({ message, content }),
-      });
-      return res.refined_content;
-    } catch (err) {
-      setError(err);
-      return null;
-    }
-  }, [setError]);
-
   const regeneratePdf = useCallback(async (taskId: string) => {
     try {
       return await apiJson<{ success: boolean; pdf_path?: string; backend_used?: string; error?: string }>(
@@ -354,7 +341,6 @@ export function useNewsletterTask() {
     fetchStageContent,
     executeStage,
     updateStageContent,
-    refineStage,
     regeneratePdf,
     openWs,
     closeWs,

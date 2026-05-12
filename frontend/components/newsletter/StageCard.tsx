@@ -11,7 +11,6 @@ import {
   Play,
   RefreshCw,
   Save,
-  Sparkles,
   XCircle,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
@@ -32,6 +31,7 @@ import {
 } from '@/types/newsletter';
 
 import { ConsoleOutput } from './ConsoleOutput';
+import { QualityDashboard } from './QualityDashboard';
 import { StageAdvancedSettings } from './StageAdvancedSettings';
 
 interface Props {
@@ -43,8 +43,7 @@ interface Props {
   onModeConfigChange: (next: StageModeConfig) => void;
   onExecute: () => void;
   onUpdateContent: (content: string) => Promise<void>;
-  onRefine: (instruction: string, content: string) => Promise<string | null>;
-  onRegeneratePdf?: () => Promise<{ success: boolean; pdf_path?: string; error?: string } | null>;
+  onRegeneratePdf?: () => Promise<{ success: boolean; pdf_path?: string; backend_used?: string; error?: string } | null>;
   workDir: string;
   busy?: boolean;
 }
@@ -65,7 +64,7 @@ function downloadMarkdown(content: string) {
 }
 
 export function StageCard({
-  taskId: _taskId,
+  taskId,
   stage,
   stageContent,
   consoleLines,
@@ -73,7 +72,6 @@ export function StageCard({
   onModeConfigChange,
   onExecute,
   onUpdateContent,
-  onRefine,
   onRegeneratePdf,
   workDir,
   busy,
@@ -84,9 +82,7 @@ export function StageCard({
   // changes, so the textarea reflects the latest backend version.
   const [draft, setDraft] = useState<string>(stageContent?.content ?? '');
   const [view, setView] = useState<ViewMode>('preview');
-  const [refineMessage, setRefineMessage] = useState('');
-  const [refining, setRefining] = useState(false);
-  const [pdfStatus, setPdfStatus] = useState<{ success: boolean; pdf_path?: string; error?: string } | null>(null);
+  const [pdfStatus, setPdfStatus] = useState<{ success: boolean; pdf_path?: string; backend_used?: string; error?: string } | null>(null);
   const [regeneratingPdf, setRegeneratingPdf] = useState(false);
 
   useEffect(() => {
@@ -111,21 +107,6 @@ export function StageCard({
   async function saveContent() {
     await onUpdateContent(draft);
     setView('preview');
-  }
-
-  async function handleRefine() {
-    if (!refineMessage.trim()) return;
-    setRefining(true);
-    try {
-      const next = await onRefine(refineMessage, draft);
-      if (next) {
-        setDraft(next);
-        setRefineMessage('');
-        setView('preview');
-      }
-    } finally {
-      setRefining(false);
-    }
   }
 
   async function handleRegenerate() {
@@ -261,14 +242,15 @@ export function StageCard({
         />
       </div>
 
-      {/* Score card — Stage 5 only, when output is available. */}
+      {/* Score card + Quality dashboard — Stage 5 only, when output is available. */}
       {stage.stage_number === 5 && isDone && scoreCard && (
-        <div className="mt-4">
+        <div className="mt-4 space-y-4">
           <ScoreCardView score={scoreCard} accent={accent} />
+          <QualityDashboard taskId={taskId} accent={accent} />
         </div>
       )}
 
-      {/* Output preview / editor / refine — only when stage has content. */}
+      {/* Output preview / editor — only when stage has content. */}
       {isDone && stageContent && (
         <div className="mt-4 space-y-3">
           {/* Preview / Edit toggle + actions */}
@@ -348,6 +330,19 @@ export function StageCard({
               PDF generation failed: {pdfStatus.error ?? 'unknown error'}
             </div>
           )}
+          {pdfStatus && pdfStatus.success && pdfStatus.backend_used && (
+            <div
+              className="rounded-lg border px-3 py-2 text-xs"
+              style={{
+                borderColor: pdfStatus.backend_used === 'fpdf2' ? 'rgba(245, 158, 11, 0.4)' : 'rgba(34, 197, 94, 0.3)',
+                backgroundColor: pdfStatus.backend_used === 'fpdf2' ? 'rgba(245, 158, 11, 0.08)' : 'rgba(34, 197, 94, 0.06)',
+                color: pdfStatus.backend_used === 'fpdf2' ? '#fbbf24' : '#86efac',
+              }}
+            >
+              PDF rendered with <span className="font-mono">{pdfStatus.backend_used}</span>
+              {pdfStatus.backend_used === 'fpdf2' && ' (WeasyPrint unavailable — fallback)'}
+            </div>
+          )}
 
           {/* Markdown content */}
           {view === 'preview' ? (
@@ -371,30 +366,6 @@ export function StageCard({
             />
           )}
 
-          {/* Refine row */}
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              type="text"
-              value={refineMessage}
-              onChange={(e) => setRefineMessage(e.target.value)}
-              placeholder={`Ask the model to refine this ${STAGE_NAMES[stage.stage_number].toLowerCase()}…`}
-              className="flex-1 min-w-[260px] rounded-lg border px-3 py-2 text-xs outline-none"
-              style={{
-                backgroundColor: 'var(--mars-color-surface)',
-                borderColor: 'var(--mars-color-border)',
-                color: 'var(--mars-color-text)',
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleRefine();
-                }
-              }}
-            />
-            <Button onClick={handleRefine} loading={refining} disabled={!refineMessage.trim() || refining}>
-              <Sparkles size={13} /> Refine
-            </Button>
-          </div>
         </div>
       )}
     </Card>

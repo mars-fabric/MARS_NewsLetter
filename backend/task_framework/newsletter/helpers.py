@@ -359,8 +359,218 @@ async def run_stage_4(
             date_from=setup["date_from"], date_to=setup["date_to"],
         )
 
+    # Production gate: the writer sometimes runs out of output budget and
+    # silently drops mid-document sections (e.g. emits 1-9 then jumps to
+    # 19-22). Detect missing canonical sections and fill them in a focused
+    # continuation pass so Stage 5 never sees a half-written report.
+    draft, completion_report = await _ensure_22_sections(
+        draft=draft, outline=outline, curated=curated,
+        setup=setup, work_dir=work_dir, mode=mode, merged=merged,
+        cost_callback=cost_callback,
+    )
+    if completion_report.get("filled_sections"):
+        logger.info(
+            "stage_4_continuation_pass_applied",
+            filled=completion_report["filled_sections"],
+            still_missing=completion_report.get("still_missing") or [],
+        )
+
     draft_path = _write(work_dir, 4, stage_def(4)["file"], draft)
-    return {"draft": draft, "outline": outline}, draft, [outline_path, draft_path]
+    coverage = _user_url_coverage(work_dir=work_dir, draft=draft,
+                                  setup_user_urls=setup.get("user_urls") or [])
+    files = [outline_path, draft_path]
+    if coverage:
+        notes_path = _write(work_dir, 4, "source_coverage.json", _json_dump(coverage))
+        files.append(notes_path)
+    if completion_report.get("filled_sections") or completion_report.get("still_missing"):
+        cont_path = _write(work_dir, 4, "section_completion.json",
+                           _json_dump(completion_report))
+        files.append(cont_path)
+    return (
+        {
+            "draft": draft, "outline": outline,
+            "stage4_source_coverage": coverage,
+            "stage4_section_completion": completion_report,
+        },
+        draft, files,
+    )
+
+
+# Canonical 22 sections — must stay in sync with prompts/stages.py writer prompt
+# AND with stage5/nodes.py _CANONICAL_22 (single source of truth would be nicer,
+# but cross-package import here would create a circular dep).
+_CANONICAL_22_HELPERS: Tuple[str, ...] = (
+    "Newsletter Metadata", "Editor's Note", "Executive Summary",
+    "TL;DR", "Industry & Subdomain Focus", "Top Story of the Period",
+    "Secondary Major Story", "Other Notable Headlines", "Subdomain Highlights",
+    "Releases & Announcements", "Trend Intelligence", "Audience-Centric Analysis",
+    "Focus Topic Deep Dive", "Source-Driven Insights", "Data & Evidence",
+    "Quotes & Opinions", "Tools & Resources", "Action & Utility",
+    "Forward-Looking Intelligence", "Transparency & Methodology",
+    "Compliance & Trust", "Closure",
+)
+
+
+def _present_canonical_sections(draft: str) -> List[int]:
+    """Return the indices (1-based) of canonical sections found in the draft."""
+    import re
+    headings = re.findall(r"^##+\s+([^\n]+)$", draft or "", flags=re.MULTILINE)
+    present: List[int] = []
+    for idx, name in enumerate(_CANONICAL_22_HELPERS, start=1):
+        if any(name.lower() in h.lower() for h in headings):
+            present.append(idx)
+    return present
+
+
+async def _ensure_22_sections(
+    *, draft: str, outline: str, curated: str,
+    setup: Dict[str, Any], work_dir: str, mode: CmbAgentMode,
+    merged: Dict[str, Any],
+    cost_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> Tuple[str, Dict[str, Any]]:
+    """If the writer dropped sections, run a focused continuation pass.
+
+    Produces ONLY the missing section bodies, then splices them back into
+    the draft at the right insertion points. Caps at one continuation pass —
+    if it still misses anything, we surface that to Stage 5 / the dashboard
+    rather than looping.
+    """
+    present = _present_canonical_sections(draft)
+    missing_idx = [i for i in range(1, 23) if i not in present]
+    if not missing_idx:
+        return draft, {"filled_sections": [], "still_missing": []}
+
+    missing_names = [_CANONICAL_22_HELPERS[i - 1] for i in missing_idx]
+    catalogue = "\n".join(
+        f"  {i}. ## {i}. {_CANONICAL_22_HELPERS[i - 1]}"
+        for i in missing_idx
+    )
+    prompt = (
+        f"# Newsletter Continuation — fill missing sections only\n\n"
+        f"Coverage window: {setup.get('date_from')} → {setup.get('date_to')}\n"
+        f"Industries: {', '.join(i.get('industry','') for i in setup.get('industries', []))}\n"
+        f"Audience: {setup.get('audience') or 'general business stakeholders'}\n\n"
+        "The Stage-4 writer produced a draft that is missing the canonical "
+        "sections listed below. Write **only** those sections, in order, with "
+        "their exact `## N. <Heading>` lines verbatim. Each section body must "
+        "be substantive (60–180 words). Cite inline as `[<domain>](<url>)` "
+        "drawn ONLY from the curated set below. If a section has no in-window "
+        "material, keep the heading and write "
+        "`_(no in-window material — to monitor next period)_` as the body.\n\n"
+        f"## Sections to write (in order)\n{catalogue}\n\n"
+        "## Outline (for thematic continuity)\n"
+        "<<OUTLINE_BEGIN>>\n" + (outline or "")[:6000] + "\n<<OUTLINE_END>>\n\n"
+        "## Curated source material (allow-list)\n"
+        "<<CURATED_BEGIN>>\n" + (curated or "")[:12000] + "\n<<CURATED_END>>\n\n"
+        "## Existing draft tail (last 1500 chars, for stylistic continuity)\n"
+        "<<DRAFT_TAIL>>\n" + (draft or "")[-1500:] + "\n<<DRAFT_TAIL_END>>\n\n"
+        "Output ONLY the missing section markdown — start with `## "
+        f"{missing_idx[0]}. {_CANONICAL_22_HELPERS[missing_idx[0]-1]}` and "
+        "end after the last requested section. No preamble, no closing "
+        "commentary, no triple backticks."
+    )
+
+    try:
+        added = await call_llm_with_antirefusal(
+            lambda p: run_ai_stage(
+                prompt=p, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir,
+                agent="researcher", config_overrides=merged,
+                cost_callback=cost_callback, max_rounds=10,
+            ),
+            primary_prompt=prompt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stage_4_continuation_failed", error=str(exc)[:200])
+        return draft, {"filled_sections": [], "still_missing": missing_idx,
+                       "error": str(exc)[:200]}
+
+    if is_refusal_text(added) or not (added or "").strip():
+        return draft, {"filled_sections": [], "still_missing": missing_idx,
+                       "error": "continuation pass refused or empty"}
+
+    merged_draft = _splice_continuation(draft=draft, addition=added,
+                                        missing_idx=missing_idx)
+    new_present = _present_canonical_sections(merged_draft)
+    still_missing = [i for i in missing_idx if i not in new_present]
+    filled = [i for i in missing_idx if i in new_present]
+    return merged_draft, {"filled_sections": filled,
+                          "still_missing": still_missing}
+
+
+def _splice_continuation(*, draft: str, addition: str, missing_idx: List[int]) -> str:
+    """Insert the continuation block at the lowest missing-index position.
+
+    For the typical failure (writer emits 1-9 then jumps to 19-22 and the
+    missing block is 10-18 contiguously), this puts the continuation between
+    section 9 and section 19. For non-contiguous gaps, the addition is still
+    inserted at the first gap point — better than appending at the end since
+    Stage 5's section parser walks top-to-bottom.
+    """
+    import re
+    if not missing_idx:
+        return draft + "\n\n" + addition.strip() + "\n"
+    first_missing = missing_idx[0]
+    # Insert before the heading that follows the first missing index, i.e. the
+    # next present canonical section after the gap.
+    next_present = next((i for i in range(first_missing + 1, 23)
+                        if i in _present_canonical_sections(draft)), None)
+    cleaned = addition.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    if next_present is None:
+        return draft.rstrip() + "\n\n" + cleaned + "\n"
+    # Find the heading line for the next-present canonical section.
+    name = _CANONICAL_22_HELPERS[next_present - 1]
+    pattern = re.compile(
+        r"^##+\s+(?:" + re.escape(str(next_present)) + r"\.\s+)?[^\n]*"
+        + re.escape(name) + r"[^\n]*$",
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    m = pattern.search(draft)
+    if not m:
+        return draft.rstrip() + "\n\n" + cleaned + "\n"
+    return draft[:m.start()].rstrip() + "\n\n" + cleaned + "\n\n" + draft[m.start():]
+
+
+def _user_url_coverage(*, work_dir: str, draft: str, setup_user_urls: List[str]) -> Dict[str, Any]:
+    """Diagnose whether the Stage-4 writer cited the user-provided URLs.
+
+    Reads ``stage_2/link_validation.json`` if present (so we honour the relevance
+    gate's "dropped: unrelated" notes), falling back to the raw setup list.
+    Returns a small structured report consumed by Stage 5 / the dashboard. Does
+    not fail or rewrite the draft — bubbling the gap is enough.
+    """
+    expected: List[str] = []
+    val_path = Path(work_dir) / "stage_2" / "link_validation.json"
+    if val_path.is_file():
+        try:
+            with val_path.open("r", encoding="utf-8") as f:
+                rows = json.load(f) or []
+            for r in rows:
+                if isinstance(r, dict) and r.get("url") and (r.get("notes") or "").lower() != "dropped: unrelated":
+                    expected.append(r["url"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not expected:
+        expected = [u for u in (setup_user_urls or []) if u]
+    if not expected:
+        return {}
+
+    draft_urls = _extract_urls(draft)
+    cited: List[str] = []
+    missing: List[str] = []
+    for u in expected:
+        if u in draft_urls or u.rstrip("/") in draft_urls:
+            cited.append(u)
+        else:
+            missing.append(u)
+    return {
+        "expected_user_urls": len(expected),
+        "cited_user_urls": len(cited),
+        "missing_user_urls": missing,
+        "coverage_pct": round(100.0 * len(cited) / len(expected), 1),
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -377,6 +587,17 @@ async def run_stage_5(
     config_overrides: Optional[Dict[str, Any]] = None,
     cost_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[Dict[str, Any], str, List[str]]:
+    # Stage 5 runs through the LangGraph pipeline (URL verification + LLM
+    # critic + DDGS-backed claim re-search + editor + scorer + dashboard).
+    # Set STAGE5_LEGACY=1 to fall back to the cmbagent-based path below.
+    if os.environ.get("STAGE5_LEGACY") not in ("1", "true", "yes"):
+        from .stage5 import run_stage_5_langgraph
+        return await run_stage_5_langgraph(
+            work_dir=work_dir, setup=setup, draft=draft, curated=curated,
+            mode_override=mode_override, config_overrides=config_overrides,
+            cost_callback=cost_callback,
+        )
+
     industries = [i["industry"] for i in setup.get("industries", [])]
     sub_domains: List[str] = []
     for i in setup.get("industries", []):
@@ -474,7 +695,7 @@ async def run_stage_5(
     # ── PDF ──────────────────────────────────────────────────────────────────
     industry_titles = ", ".join(industries) or "Newsletter"
     title = f"{industry_titles} — {setup.get('date_from')} to {setup.get('date_to')}"
-    pdf = render_pdf(markdown_text=final_with_score, output_dir=os.path.join(work_dir, "stage_5"), title=title)
+    pdf = render_pdf(markdown_text=final_with_score, output_dir=os.path.join(work_dir, "stage_5"), title=title, setup=setup)
 
     notes_path = _write(
         work_dir, 5, "verification_notes.md",

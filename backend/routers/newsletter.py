@@ -1,4 +1,4 @@
-"""NewsLetter wizard endpoints — create task, execute stages, read content, refine, list runs.
+"""NewsLetter wizard endpoints — create task, execute stages, read content, list runs.
 
 Persistence model: cmbagent's ORM (TaskStage, WorkflowRun) owns the canonical
 stage status / output rows. The user-supplied Stage-1 setup payload is stored
@@ -35,15 +35,12 @@ from models.newsletter_schemas import (
     NewsletterCreateResponse,
     NewsletterExecuteRequest,
     NewsletterRecentTaskResponse,
-    NewsletterRefineRequest,
-    NewsletterRefineResponse,
     NewsletterStageResponse,
     NewsletterTaskStateResponse,
     StageContentResponse,
 )
 from services import session_manager, taxonomy_service
 from task_framework.newsletter import helpers as nl
-from task_framework.newsletter.mode_dispatcher import run_ai_stage
 from task_framework.newsletter.pdf_generator import render_pdf
 
 logger = get_logger(__name__)
@@ -612,266 +609,6 @@ async def update_stage_content(task_id: str, stage_num: int, req: NewsletterCont
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Refine (chat-style edit on the current content)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@router.post("/{task_id}/stages/{stage_num}/refine", response_model=NewsletterRefineResponse)
-async def refine_stage(task_id: str, stage_num: int, req: NewsletterRefineRequest) -> NewsletterRefineResponse:
-    if stage_num < 1 or stage_num > len(nl.STAGE_DEFS):
-        raise HTTPException(status_code=400, detail="invalid stage number")
-    if stage_num == 1:
-        raise HTTPException(status_code=400, detail="Stage 1 has no LLM refinement — edit fields directly")
-
-    db = _get_db()
-    try:
-        from cmbagent.database.models import WorkflowRun  # type: ignore
-        run = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
-        if run is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        work_dir = _work_dir_for(task_id, run.session_id, base=None)
-    finally:
-        db.close()
-
-    # Refinement is a *surgical* edit, not a rewrite. Long inputs (~5k+ words)
-    # routinely get truncated when a model is asked to regenerate the whole
-    # document, so for newsletters with a numbered ## structure we use a
-    # section-targeted strategy:
-    #   1. Parse the document into [head_block, sec_1, sec_2, ...].
-    #   2. Pick which sections the instruction targets — explicit "section N"
-    #      or "## N." references win; otherwise an LLM router decides.
-    #   3. Refine ONLY the targeted sections (each call sees ~one section of
-    #      content, not the whole document).
-    #   4. Splice the updated sections back into the original document so the
-    #      untouched 90% of the newsletter is byte-identical to the input.
-    #
-    # When the document has no numbered sections (rare — early Stage-2/3 markdown,
-    # short refine targets) we fall back to whole-document refinement and a
-    # truncation guard that returns 422 instead of clobbering the user's content.
-    refined = await _section_targeted_refine(
-        instruction=req.message,
-        content=req.content,
-        work_dir=work_dir,
-    )
-    return NewsletterRefineResponse(refined_content=refined)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Section-targeted refinement helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-_SECTION_HEADING_RE_REFINE = None  # lazy-compiled in _split_numbered_sections
-
-
-def _split_numbered_sections(text: str) -> tuple[str, list[tuple[int, str, str]]]:
-    """Split markdown into (head, [(num, heading_line, body), ...]).
-
-    A section starts at a ``## <N>. <Title>`` line and runs until the next such
-    line (or end of document). Returns the head block (everything before the
-    first numbered heading) plus the ordered list of sections. If the document
-    has no numbered sections, returns (text, []).
-    """
-    import re as _re
-    pattern = _re.compile(r"^##\s+(\d+)\.\s+.*$", flags=_re.MULTILINE)
-    matches = list(pattern.finditer(text or ""))
-    if not matches:
-        return text or "", []
-    head = (text or "")[: matches[0].start()]
-    sections: list[tuple[int, str, str]] = []
-    for i, m in enumerate(matches):
-        num = int(m.group(1))
-        heading_line = m.group(0)
-        body_start = m.start()
-        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text or "")
-        body = (text or "")[body_start:body_end]
-        sections.append((num, heading_line, body))
-    return head, sections
-
-
-def _explicit_target_sections(instruction: str, available: list[int]) -> list[int]:
-    """Pull explicit `section N` / `## N.` numbers out of the instruction.
-
-    Returns only numbers that actually exist in the document.
-    """
-    import re as _re
-    found: list[int] = []
-    for m in _re.finditer(r"(?:section|sec\.?|##)\s*#?\s*(\d{1,2})\b", instruction or "", flags=_re.IGNORECASE):
-        n = int(m.group(1))
-        if n in available and n not in found:
-            found.append(n)
-    return found
-
-
-async def _route_target_sections(
-    *, instruction: str, sections: list[tuple[int, str, str]], work_dir: str,
-) -> list[int]:
-    """Ask an LLM to pick which numbered sections an instruction targets.
-
-    Returns a sorted list of section numbers. Falls back to "all sections that
-    obviously match by keyword" on parse failure.
-    """
-    catalogue = "\n".join(f"  {num}. {heading.lstrip('# ').strip()}" for num, heading, _ in sections)
-    prompt = (
-        "Identify which numbered newsletter sections a refinement instruction targets.\n\n"
-        f"## Instruction\n{instruction}\n\n"
-        f"## Available sections\n{catalogue}\n\n"
-        "Return a JSON array of section numbers, e.g. `[2, 4]`. If the instruction "
-        "applies to the whole document, return `\"all\"`. Output JSON only, no commentary."
-    )
-    try:
-        raw = await run_ai_stage(
-            prompt=prompt, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
-            max_rounds=4,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("refine_router_failed", error=str(exc)[:200])
-        return [num for num, _, _ in sections]
-
-    import json as _json
-    import re as _re
-    txt = (raw or "").strip()
-    m = _re.search(r"\[[^\]]*\]|\"all\"", txt)
-    if not m:
-        logger.warning("refine_router_unparseable", raw=txt[:200])
-        return [num for num, _, _ in sections]
-    snippet = m.group(0)
-    if snippet.strip().strip('"') == "all":
-        return [num for num, _, _ in sections]
-    try:
-        nums = _json.loads(snippet)
-        return sorted({int(n) for n in nums if isinstance(n, (int, float)) and int(n) in {s[0] for s in sections}})
-    except Exception:
-        return [num for num, _, _ in sections]
-
-
-async def _refine_one_section(
-    *, instruction: str, num: int, heading: str, body: str, work_dir: str,
-) -> str:
-    """Re-render a single numbered section. Returns the new body (heading included)."""
-    prompt = (
-        "# Section refinement (surgical edit)\n\n"
-        "Apply the user's instruction to this single newsletter section and return the updated section.\n\n"
-        "## Hard rules\n"
-        f"1. Keep the heading exactly as: `{heading.strip()}`. Do not renumber or rename it.\n"
-        "2. Preserve every URL already present unless the instruction explicitly tells you to remove it.\n"
-        "3. Output only the section markdown (heading + body), no commentary, no triple backticks, no preamble.\n\n"
-        "## Instruction\n"
-        f"{instruction}\n\n"
-        "## Current section\n"
-        f"<<SECTION_BEGIN>>\n{body.rstrip()}\n<<SECTION_END>>\n"
-    )
-    refined = await run_ai_stage(
-        prompt=prompt, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
-    )
-    refined = (refined or "").strip()
-    # Strip stray code-fence wrappers that the writer occasionally adds.
-    if refined.startswith("```") and refined.endswith("```"):
-        refined = refined.strip("`")
-        if refined.startswith("markdown\n"):
-            refined = refined[len("markdown\n"):]
-    # Re-inject the canonical heading if the model dropped it.
-    if not refined.lstrip().startswith("##"):
-        refined = f"{heading}\n\n{refined}"
-    return refined.rstrip() + "\n\n"
-
-
-async def _section_targeted_refine(*, instruction: str, content: str, work_dir: str) -> str:
-    """Section-targeted refinement with whole-document fallback + guard.
-
-    Strategy: parse → route → refine targeted sections only → splice. Falls back
-    to whole-document refinement when the document has no numbered sections.
-    """
-    import re as _re
-    head, sections = _split_numbered_sections(content or "")
-
-    # Fallback for un-numbered short content (early stage outputs, etc.).
-    if not sections:
-        prompt = (
-            "# Refinement (surgical edit)\n\n"
-            "Apply the instruction below and return the entire updated markdown — preserve all content, "
-            "URLs, and structure that the instruction does not explicitly target. Output only the markdown.\n\n"
-            f"## Instruction\n{instruction}\n\n"
-            "## Current content\n"
-            f"<<CONTENT_BEGIN>>\n{content}\n<<CONTENT_END>>"
-        )
-        refined = await run_ai_stage(
-            prompt=prompt, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
-        )
-        # Truncation guard for un-numbered content.
-        if (
-            len(content or "") > 4000
-            and len(refined or "") < int(len(content or "") * 0.7)
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "refinement_truncated_output",
-                    "message": (
-                        f"The refinement model returned a shortened document "
-                        f"({len(refined or '')}/{len(content or '')} chars). "
-                        "Retry with a more targeted instruction or run it through Stage 5 again."
-                    ),
-                    "orig_len": len(content or ""),
-                    "refined_len": len(refined or ""),
-                },
-            )
-        return refined
-
-    # Pick which sections to refine.
-    available = [num for num, _, _ in sections]
-    targeted = _explicit_target_sections(instruction, available)
-    if not targeted:
-        targeted = await _route_target_sections(
-            instruction=instruction, sections=sections, work_dir=work_dir,
-        )
-    if not targeted:
-        # Router refused — be safe and refine just the smallest section so we
-        # don't accidentally regenerate the whole newsletter.
-        smallest = min(sections, key=lambda s: len(s[2]))
-        targeted = [smallest[0]]
-    logger.info(
-        "refine_targeted_sections",
-        targeted=targeted, total=len(sections), instruction=instruction[:120],
-    )
-
-    # Refine each targeted section in sequence (cheap to parallelise later).
-    new_bodies: dict[int, str] = {}
-    for num, heading, body in sections:
-        if num in targeted:
-            new_bodies[num] = await _refine_one_section(
-                instruction=instruction, num=num, heading=heading,
-                body=body, work_dir=work_dir,
-            )
-
-    # Splice everything back together. Untouched sections come back verbatim,
-    # so the untargeted 90% of the document is byte-identical to the input.
-    parts: list[str] = [head.rstrip() + ("\n\n" if head.strip() else "")]
-    for num, heading, body in sections:
-        parts.append(new_bodies.get(num, body.rstrip() + "\n\n"))
-    merged = "".join(parts).rstrip() + "\n"
-
-    # Lightweight sanity guard: total numbered sections must match the input.
-    final_section_count = len(_re.findall(r"^##\s+\d+\.\s+\S", merged, flags=_re.MULTILINE))
-    if final_section_count != len(sections):
-        logger.warning(
-            "refine_section_count_drift",
-            before=len(sections), after=final_section_count, targeted=targeted,
-        )
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "refinement_section_drift",
-                "message": (
-                    f"Refinement produced {final_section_count} sections "
-                    f"(expected {len(sections)}). Original content kept; please retry."
-                ),
-                "orig_section_count": len(sections),
-                "refined_section_count": final_section_count,
-            },
-        )
-    return merged
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Task list / state / pdf
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1018,13 +755,76 @@ async def regenerate_pdf(task_id: str) -> CompilePdfResponse:
 
     industry_titles = ", ".join(i["industry"] for i in setup.get("industries", [])) or "Newsletter"
     title = f"{industry_titles} — {setup.get('date_from')} to {setup.get('date_to')}"
-    pdf = render_pdf(markdown_text=md, output_dir=os.path.join(work_dir, "stage_5"), title=title)
+    pdf = render_pdf(markdown_text=md, output_dir=os.path.join(work_dir, "stage_5"), title=title, setup=setup)
     return CompilePdfResponse(
         pdf_path=pdf.pdf_path,
         success=pdf.success,
         backend_used=pdf.backend,
         error=pdf.error,
     )
+
+
+@router.get("/{task_id}/dashboard")
+async def get_dashboard(task_id: str) -> Dict[str, Any]:
+    """Return the Stage-5 quality dashboard payload for a task.
+
+    Pulls together: score card, evaluation aggregate, URL-verification
+    summary, critic corrections + DDGS findings, dashboard chart payload,
+    and node timings — everything the frontend Quality tab needs in one call.
+
+    Falls back to disk files when the in-DB shared state hasn't been
+    backfilled (e.g. for tasks created before the LangGraph stage 5 landed).
+    """
+    db = _get_db()
+    try:
+        from cmbagent.database.models import WorkflowRun  # type: ignore
+        run = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+        if run is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        repo = _stage_repo(db, session_id=run.session_id)
+        stage = next((s for s in repo.list_stages(parent_run_id=task_id) if s.stage_number == 5), None)
+        shared: Dict[str, Any] = {}
+        if stage is not None and (stage.output_data or {}).get("shared"):
+            shared = stage.output_data["shared"]
+        work_dir = _work_dir_for(task_id, run.session_id, base=None)
+    finally:
+        db.close()
+
+    stage5_dir = os.path.join(work_dir, "stage_5")
+
+    def _load_json(name: str) -> Any:
+        p = os.path.join(stage5_dir, name)
+        if not os.path.isfile(p):
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                import json as _json
+                return _json.load(f)
+        except Exception:
+            return None
+
+    dashboard = shared.get("stage5_dashboard") or _load_json("dashboard.json") or {}
+    dashboard_metrics = shared.get("stage5_dashboard_metrics") or {}
+    aggregate = shared.get("stage5_aggregate") or _load_json("evaluation.json") or {}
+    score_card = shared.get("score_card") or _load_json("score_card.json") or {}
+    url_verification = shared.get("stage5_url_verification") or _load_json("url_verification.json") or {}
+    critic = shared.get("stage5_critic") or _load_json("critic_report.json") or {}
+    timings = shared.get("stage5_timings") or {}
+    notes = shared.get("verification_notes") or []
+
+    return {
+        "task_id": task_id,
+        "stage_5_status": getattr(stage, "status", None) if stage else None,
+        "score_card": score_card,
+        "aggregate": aggregate,
+        "dashboard": dashboard,
+        "dashboard_metrics": dashboard_metrics,
+        "url_verification": url_verification,
+        "critic": critic,
+        "verification_notes": notes,
+        "node_timings": timings,
+        "pdf_path": shared.get("pdf_path"),
+    }
 
 
 @router.post("/{task_id}/repair-score-card")

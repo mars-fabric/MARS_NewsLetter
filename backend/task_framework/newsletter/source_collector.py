@@ -35,7 +35,7 @@ from models.newsletter_schemas import CmbAgentMode, SourceMode
 
 from .antirefusal import call_llm_with_antirefusal, looks_like_query_plan_only
 from .link_validator import LinkResult, summarize_validation, validate_links
-from .mode_dispatcher import run_ai_stage
+from .mode_dispatcher import run_ai_stage  # noqa: F401 — used by relevance gate via local import
 from .prompts.stages import (
     discovery_planner_prompt,
     discovery_researcher_prompt,
@@ -78,11 +78,20 @@ async def collect_sources(
     validation: List[LinkResult] = []
     if user_urls and source_mode != SourceMode.DDGS_ONLY:
         validation = await validate_links(user_urls, industries=industries)
+        # Soft relevance gate — only drop a user URL when the model explicitly
+        # says it's unrelated to the industries. "unknown" / "borderline"
+        # verdicts keep the link in the set; the user added it for a reason.
+        validation = await _gate_user_urls_relevance(
+            validation=validation, industries=industries, sub_domains=sub_domains,
+            work_dir=work_dir, mode=mode, config_overrides=config_overrides,
+            cost_callback=cost_callback,
+        )
         logger.info(
             "user_urls_validated",
             total=len(validation),
             reachable=sum(1 for r in validation if r.reachable),
             authentic=sum(1 for r in validation if r.is_authentic),
+            kept_after_relevance_gate=sum(1 for r in validation if (r.notes or "").lower() != "dropped: unrelated"),
         )
 
     sections: List[str] = [
@@ -94,7 +103,9 @@ async def collect_sources(
         "",
     ]
 
-    # ── 2. User URLs section (always rendered when we have them) ──────────────
+    # ── 2. User URLs section (always rendered when we have them). The
+    # relevance gate may have tagged some "dropped: unrelated"; we render
+    # them but flag them visibly so the curator knows not to cite them.
     if validation:
         sections.append("## User-Provided Links — Validation")
         sections.append(summarize_validation(validation))
@@ -114,28 +125,33 @@ async def collect_sources(
         return "\n".join(sections), validation, []
 
     # ── 4. DDGS / combined path: 3 substeps. ──────────────────────────────────
+    # Production rule: in DDGS/COMBINED modes we always discover the top-N
+    # companies. Even a small floor of 6 is better than skipping company
+    # discovery entirely, because the per-company news pass anchors Stage 3
+    # with vendor-canonical sources. A caller can still pass top_n=0 to skip,
+    # but the UI default is 10+.
+    effective_top_n = max(int(top_companies_count or 0), 6)
     seed_companies: List[Dict[str, str]] = []
-    if top_companies_count and top_companies_count > 0:
-        company_md, seed_companies = await _discover_top_companies(
-            industries=industries, sub_domains=sub_domains, top_n=top_companies_count,
-            date_from=date_from, date_to=date_to,
-            user_urls=user_urls if source_mode == SourceMode.COMBINED else [],
-            audience=audience, work_dir=work_dir, mode=mode,
+    company_md, seed_companies = await _discover_top_companies(
+        industries=industries, sub_domains=sub_domains, top_n=effective_top_n,
+        date_from=date_from, date_to=date_to,
+        user_urls=user_urls if source_mode == SourceMode.COMBINED else [],
+        audience=audience, work_dir=work_dir, mode=mode,
+        config_overrides=config_overrides, cost_callback=cost_callback,
+    )
+    sections.append(f"## 2-A — Top {effective_top_n} Companies (web-discovered)")
+    sections.append(company_md)
+    sections.append("")
+
+    if seed_companies:
+        per_company_md = await _extract_per_company_news(
+            companies=seed_companies, industries=industries, sub_domains=sub_domains,
+            date_from=date_from, date_to=date_to, work_dir=work_dir, mode=mode,
             config_overrides=config_overrides, cost_callback=cost_callback,
         )
-        sections.append(f"## 2-A — Top {top_companies_count} Companies (web-discovered)")
-        sections.append(company_md)
+        sections.append("## 2-B — Per-Company News & Innovations")
+        sections.append(per_company_md)
         sections.append("")
-
-        if seed_companies:
-            per_company_md = await _extract_per_company_news(
-                companies=seed_companies, industries=industries, sub_domains=sub_domains,
-                date_from=date_from, date_to=date_to, work_dir=work_dir, mode=mode,
-                config_overrides=config_overrides, cost_callback=cost_callback,
-            )
-            sections.append("## 2-B — Per-Company News & Innovations")
-            sections.append(per_company_md)
-            sections.append("")
 
     # 2-C: industry-wide discovery (always runs when we're in DDGS / combined).
     industry_md = await _industry_wide_discovery(
@@ -151,6 +167,21 @@ async def collect_sources(
     sections.append("## 2-C — Industry-Wide News & Trends")
     sections.append(industry_md)
     sections.append("")
+
+    # 2-D: enrich user URLs as structured items in COMBINED mode so the
+    # curator (Stage 3) sees them as first-class content, not just a
+    # validation table. USER_LINKS_ONLY already short-circuits earlier.
+    if source_mode == SourceMode.COMBINED and validation and enrich_with_llm:
+        keep = [r for r in validation if (r.notes or "").lower() != "dropped: unrelated"]
+        if keep:
+            enriched = await _enrich_user_urls(
+                validation=keep, industries=industries, sub_domains=sub_domains,
+                date_from=date_from, date_to=date_to, work_dir=work_dir,
+                mode=mode, config_overrides=config_overrides, cost_callback=cost_callback,
+            )
+            sections.append("## 2-D — User-Provided Links (enriched)")
+            sections.append(enriched)
+            sections.append("")
 
     return "\n".join(sections), validation, seed_companies
 
@@ -373,6 +404,76 @@ async def _industry_wide_one_shot(
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional: enrich user URLs in user_links_only mode
 # ──────────────────────────────────────────────────────────────────────────────
+
+async def _gate_user_urls_relevance(
+    *, validation: List[LinkResult], industries: List[str], sub_domains: List[str],
+    work_dir: str,
+    mode: CmbAgentMode,  # noqa: ARG001 — kept for call-site symmetry; gate always uses ONE_SHOT
+    config_overrides: Dict[str, Any],
+    cost_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> List[LinkResult]:
+    """Tag explicitly-unrelated user URLs without removing them.
+
+    Rule (user-stated): keep the link unless we have a strong signal it is
+    completely unrelated to any chosen industry or sub-domain. We mark such
+    rare cases via ``result.notes = "dropped: unrelated"`` so downstream
+    enrichment can skip them — the validation report still surfaces every
+    link to the user.
+
+    Implementation: a tiny one-shot LLM classifier over the URL+domain list.
+    If the call fails for any reason, we keep every link (fail-open) so we
+    never silently lose a user-provided source.
+    """
+    if not validation:
+        return validation
+    industry_lbl = ", ".join(industries) or "(any)"
+    sub_lbl = ", ".join(sub_domains) or "(any)"
+    listing = "\n".join(
+        f"{i+1}. {r.url}  (domain: {r.domain or '?'}, tier: {r.authority_tier})"
+        for i, r in enumerate(validation)
+    )
+    prompt = (
+        "# User-URL relevance gate\n\n"
+        f"Industries: {industry_lbl}\n"
+        f"Sub-domains: {sub_lbl}\n\n"
+        "For each numbered URL below, decide whether it is **completely unrelated** to ALL of\n"
+        "the industries / sub-domains above. Be conservative — only mark `unrelated` when the\n"
+        "URL is clearly off-topic (e.g. recipes, sports scores, personal blogs unrelated to the\n"
+        "subject). Anything plausibly on-topic, ambiguous, or whose subject you cannot infer\n"
+        "from the URL alone counts as `related`.\n\n"
+        f"{listing}\n\n"
+        "Return ONLY a JSON array of objects like:\n"
+        '`[{"n": 1, "verdict": "related"}, {"n": 2, "verdict": "unrelated"}, ...]`\n'
+        "Do not include reasoning, prose, or markdown fences."
+    )
+    try:
+        raw = await run_ai_stage(
+            prompt=prompt, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
+            config_overrides=config_overrides, cost_callback=cost_callback,
+            max_rounds=4,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("user_url_relevance_gate_failed_keep_all", error=str(exc)[:200])
+        return validation
+
+    import json as _json
+    txt = (raw or "").strip()
+    m = re.search(r"\[[\s\S]*\]", txt)
+    if not m:
+        logger.warning("user_url_relevance_gate_unparseable", raw=txt[:200])
+        return validation
+    try:
+        verdicts = _json.loads(m.group(0))
+    except Exception:
+        logger.warning("user_url_relevance_gate_json_error", raw=txt[:200])
+        return validation
+
+    by_n = {int(v.get("n")): (v.get("verdict") or "").lower() for v in verdicts if isinstance(v, dict) and v.get("n") is not None}
+    for idx, r in enumerate(validation, start=1):
+        if by_n.get(idx) == "unrelated":
+            r.notes = "dropped: unrelated"
+    return validation
+
 
 async def _enrich_user_urls(
     *, validation: List[LinkResult], industries: List[str], sub_domains: List[str],

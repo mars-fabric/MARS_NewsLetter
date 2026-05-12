@@ -201,7 +201,7 @@ class NewsletterCreateRequest(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-stage execute / content / refine
+# Per-stage execute / content
 # ──────────────────────────────────────────────────────────────────────────────
 
 class NewsletterExecuteRequest(BaseModel):
@@ -214,12 +214,6 @@ class NewsletterContentUpdateRequest(BaseModel):
     """PUT /api/newsletter/{task_id}/stages/{num}/content"""
     content: str
     field: str = Field("default", description="shared_state key to update; 'default' picks the stage's primary key")
-
-
-class NewsletterRefineRequest(BaseModel):
-    """POST /api/newsletter/{task_id}/stages/{num}/refine — chat-style edit."""
-    message: str
-    content: str
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -297,11 +291,6 @@ class NewsletterRecentTaskResponse(BaseModel):
     created_at: Optional[str] = None
     current_stage: Optional[int] = None
     progress_percent: float = 0.0
-
-
-class NewsletterRefineResponse(BaseModel):
-    refined_content: str
-    message: str = "Content refined successfully"
 
 
 class TaxonomyResponse(BaseModel):

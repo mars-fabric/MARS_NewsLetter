@@ -277,7 +277,6 @@ export function NewsletterApp({ resumeTaskId = null, onBack, onTaskCreated }: Ne
             onModeConfigChange={setLiveModeConfig}
             onExecute={() => executeStage(activeStage)}
             onUpdateContent={(content) => t.updateStageContent(t.taskId as string, activeStage, content)}
-            onRefine={(msg, content) => t.refineStage(t.taskId as string, activeStage, msg, content)}
             onRegeneratePdf={activeStage === 5 ? () => t.regeneratePdf(t.taskId as string) : undefined}
             workDir={t.task.work_dir ?? ''}
             busy={t.loading}

@@ -103,7 +103,17 @@ def verify_and_clean(
     notes: List[str] = []
     text = final_text or ""
 
-    # 0. Heading normalisation — restore canonical numbered headings the editor
+    # 0a. Strip any pre-document preamble the editor may have prepended before
+    #     the actual `# <Title>` heading. When the editor agent runs in P&C
+    #     mode, the engineer sometimes writes content via a Python snippet,
+    #     the snippet fails on long strings, and the model narrates the failure
+    #     ("The Python snippet failed because…") above the real markdown.
+    #     Deterministic fix: discard everything before the first level-1
+    #     heading and any stray HTML comments / code-fence markers right after.
+    text, preamble_notes = _strip_pre_heading_preamble(text)
+    notes.extend(preamble_notes)
+
+    # 0b. Heading normalisation — restore canonical numbered headings the editor
     #    may have thematically renamed (e.g. ``## 13. AI & Data Infrastructure``
     #    → ``## 13. Focus Topic Deep Dive``). The writer is instructed to emit
     #    these verbatim; the editor sometimes overrides. We trust the section
@@ -305,6 +315,38 @@ def parse_score_card(raw: str) -> Dict[str, Any]:
             continue
 
     return fallback
+
+
+_TOP_HEADING_PREAMBLE_RE = re.compile(r"^# +\S", re.MULTILINE)
+
+
+def _strip_pre_heading_preamble(text: str) -> Tuple[str, List[str]]:
+    """Drop any text before the first top-level `# ` heading.
+
+    Stage 5 editors occasionally narrate a failed Python snippet ("The Python
+    snippet failed because…") above the real markdown when the engineer agent
+    tries to write content via code execution. The deterministic fix is to
+    drop everything before the first `# ` line and clean stray fences right
+    after.
+    """
+    if not text:
+        return text, []
+    notes: List[str] = []
+    m = _TOP_HEADING_PREAMBLE_RE.search(text)
+    if m and m.start() > 0:
+        notes.append(f"Stripped {m.start()} chars of pre-heading preamble.")
+        text = text[m.start():]
+    # Remove a leading HTML filename hint comment if present.
+    new_text, n = re.subn(r"^<!--[^>]*-->\s*\n?", "", text)
+    if n:
+        notes.append("Stripped leading HTML filename comment.")
+        text = new_text
+    # Remove a leading triple-backtick fence (markdown/text/python) if any.
+    new_text, n = re.subn(r"^```[a-zA-Z]*\s*\n", "", text)
+    if n:
+        notes.append("Stripped leading code-fence opener.")
+        text = new_text
+    return text, notes
 
 
 def _unwrap_python_content_script(text: str) -> str | None:
