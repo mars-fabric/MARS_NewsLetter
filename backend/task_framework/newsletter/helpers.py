@@ -260,8 +260,85 @@ async def run_stage_3(
             date_from=setup["date_from"], date_to=setup["date_to"],
         )
 
+    # Pre-verify every URL in the curated set so Stage 4 can never cite a
+    # hallucinated URL. The curator can invent URLs that follow real
+    # patterns (``ai.googleblog.com/...``) but don't actually resolve —
+    # those propagate to the final report and show up as "dead" in the
+    # dashboard. Catching them here lets the writer work from a clean
+    # allow-list. ``tier=dead`` and ``tier=error`` URLs are stripped from
+    # the curated markdown (the visible text stays). ``tier=blocked`` URLs
+    # (live but CDN-anti-bot) are preserved.
+    curated, stage3_url_health = await _verify_curated_urls(curated)
+
     path = _write(work_dir, 3, stage_def(3)["file"], curated)
-    return {"curated": curated}, curated, [path]
+    files = [path]
+    if stage3_url_health.get("total"):
+        validation_path = _write(
+            work_dir, 3, "url_validation.json", _json_dump(stage3_url_health),
+        )
+        files.append(validation_path)
+        logger.info(
+            "stage_3_url_verification",
+            total=stage3_url_health.get("total"),
+            reachable=stage3_url_health.get("reachable"),
+            stripped=stage3_url_health.get("stripped"),
+        )
+
+    return (
+        {"curated": curated, "stage3_url_health": stage3_url_health},
+        curated,
+        files,
+    )
+
+
+async def _verify_curated_urls(curated_md: str) -> Tuple[str, Dict[str, Any]]:
+    """HEAD-/GET-check every URL in the curated markdown and strip dead ones.
+
+    Returns ``(cleaned_curated_md, health_summary)``. The summary contains
+    per-URL results plus aggregates and the count of URLs we removed. The
+    markdown stripping keeps visible link text (``[text](dead-url)`` →
+    ``text``) so the curator's prose remains readable, just unlinked.
+    """
+    import re as _re
+    from .url_health import check_urls, summarise
+
+    urls = sorted({
+        u.rstrip(".,;:!?'\"]>")
+        for u in _re.findall(r"https?://[^\s)\"'<>]+", curated_md or "")
+    })
+    if not urls:
+        return curated_md, {}
+
+    results = await check_urls(urls)
+    summary = summarise(results)
+
+    # Identify URLs to strip (genuinely dead — 404/410 + other 4xx + DNS errors).
+    dead_urls = {r["url"] for r in results if r.get("tier") in ("dead", "error")}
+    if not dead_urls:
+        summary["stripped"] = 0
+        summary["stripped_urls"] = []
+        return curated_md, summary
+
+    def _strip_md_link(m: _re.Match) -> str:
+        url = m.group(2).rstrip(".,;:!?'\"]>")
+        if url in dead_urls:
+            return m.group(1)  # keep visible text only
+        return m.group(0)
+
+    cleaned = _re.sub(
+        r"\[([^\]\n]+)\]\((https?://[^)\s\n]+)\)",
+        _strip_md_link,
+        curated_md,
+    )
+    # Drop bare ``<https://...>`` references to dead URLs too.
+    for d in dead_urls:
+        cleaned = cleaned.replace(f"<{d}>", "")
+    # Tidy up any trailing whitespace that link removal left behind.
+    cleaned = _re.sub(r"[ \t]+\n", "\n", cleaned)
+
+    summary["stripped"] = len(dead_urls)
+    summary["stripped_urls"] = sorted(dead_urls)
+    return cleaned, summary
 
 
 # ──────────────────────────────────────────────────────────────────────────────

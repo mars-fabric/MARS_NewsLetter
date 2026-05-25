@@ -22,14 +22,22 @@ interface Props {
   stages?: number[];
 }
 
-// NOTE: planning_and_control is intentionally hidden from the UI for now —
-// only one_shot has been validated end-to-end. Re-add the entry here once
-// planning_and_control has been tested.
+// planning_and_control is the PaperPulse / NewsPulse workflow: a planner
+// builds a step-by-step blueprint, then a researcher/engineer pair executes
+// each step with context carryover between steps. Slower than one_shot but
+// yields more thorough Stage 2 (source collection) and Stage 3 (curation)
+// output. Stage 4 always overrides to its custom section-by-section writer
+// regardless of mode (see backend/task_framework/newsletter/stage4/).
 const MODES: { value: CmbAgentMode; label: string; help: string }[] = [
   {
     value: 'one_shot',
     label: 'one_shot',
     help: 'Single researcher agent — fastest. Best for stable, well-scoped prompts.',
+  },
+  {
+    value: 'planning_and_control',
+    label: 'planning_and_control',
+    help: 'Planner → researcher → engineer with cross-step context carryover. Slower but deeper coverage. Stages 2 & 3 benefit most.',
   },
 ];
 
@@ -162,8 +170,9 @@ export function StageAdvancedSettings({ value, onChange, stages }: Props) {
           style={{ borderTop: '1px solid var(--mars-color-border)', background: 'var(--mars-color-surface-sunken)' }}
         >
           <p className="text-[11px] leading-relaxed" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-            Choose the per-role model and iteration knobs for each AI stage.
-            Empty fields keep the cmbagent default. Every stage runs in <code className="rounded px-1 font-mono text-[10px]" style={{ background: 'var(--mars-color-surface-overlay)', color: 'var(--mars-color-text)' }}>one_shot</code> mode (single researcher agent).
+            Choose the per-stage cmbagent mode + per-role model + iteration knobs.
+            Empty model fields keep the cmbagent default. <code className="rounded px-1 font-mono text-[10px]" style={{ background: 'var(--mars-color-surface-overlay)', color: 'var(--mars-color-text)' }}>one_shot</code> runs a single researcher agent (fastest);{' '}
+            <code className="rounded px-1 font-mono text-[10px]" style={{ background: 'var(--mars-color-surface-overlay)', color: 'var(--mars-color-text)' }}>planning_and_control</code> runs a planner → researcher → engineer pipeline with cross-step context carryover (slower but deeper coverage). Stage 4 always uses the section-by-section writer regardless of mode.
           </p>
 
           {visibleStages.length > 1 && (

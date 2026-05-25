@@ -99,9 +99,20 @@ def verify_and_clean(
     *,
     final_text: str,
     allowed_urls: Set[str],
+    dead_urls: Set[str] | None = None,
 ) -> Tuple[str, List[str]]:
+    """Apply deterministic safety nets to the final markdown.
+
+    ``dead_urls`` is the optional set of URLs that Stage 5's URL verifier
+    classified as genuinely dead (404/410/DNS-fail). When supplied, those
+    URLs are stripped from the body even if they pass the curated allow-list
+    — the curator (or hallucinating writer) may have included a URL that
+    follows real-domain patterns but does not actually resolve. Visible
+    link text is preserved; only the link target is removed.
+    """
     notes: List[str] = []
     text = final_text or ""
+    dead_urls = set(dead_urls or set())
 
     # 0a. Strip any pre-document preamble the editor may have prepended before
     #     the actual `# <Title>` heading. When the editor agent runs in P&C
@@ -148,8 +159,16 @@ def verify_and_clean(
     # inside the URL portion and inside the link text portion of markdown
     # links — well-formed links never contain those, and broken/truncated
     # links should simply not match at all.
-    if allowed_urls:
+    if allowed_urls or dead_urls:
         def _url_in_allowlist(url: str) -> bool:
+            # A URL is kept only when it passes BOTH gates: it must be in
+            # the curated allow-list AND it must not be on the dead-list.
+            # Without an allow-list (legacy callers), we treat any URL as
+            # allow-listed; dead_urls still applies.
+            if dead_urls and url in dead_urls:
+                return False
+            if not allowed_urls:
+                return True
             return url in allowed_urls or any(url.startswith(a) for a in allowed_urls)
 
         def _record_strip(message: str) -> None:
@@ -161,7 +180,8 @@ def verify_and_clean(
             url = match.group(2).rstrip(".,;:!?'\"]>")
             if _url_in_allowlist(url):
                 return match.group(0)
-            _record_strip(f"Stripped URL not in curated set: {url}")
+            reason = "dead/unreachable" if (dead_urls and url in dead_urls) else "not in curated set"
+            _record_strip(f"Stripped URL ({reason}): {url}")
             return match.group(1)  # keep the visible text only — clean removal
 
         # Restrict both link text and URL to a single line: ``[^\]\n]`` and

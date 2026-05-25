@@ -24,11 +24,13 @@ interface Props {
 }
 
 const DEFAULT_MODE_CONFIG: StageModeConfig = {
-  // planning_and_control is currently hidden from the UI (not yet validated
-  // end-to-end). Default every stage to one_shot until that mode is enabled
-  // again in StageAdvancedSettings.
-  stage_2_mode: 'one_shot',
-  stage_3_mode: 'one_shot',
+  // planning_and_control is the PaperPulse-style planner→researcher→engineer
+  // pipeline; one_shot is a single researcher agent. Defaults: P&C for the
+  // discovery-heavy stages (2 source-collection, 3 curation), one_shot for
+  // the generation/review stages where Stage 4's own section orchestrator
+  // and Stage 5's LangGraph handle planning themselves.
+  stage_2_mode: 'planning_and_control',
+  stage_3_mode: 'planning_and_control',
   stage_4_mode: 'one_shot',
   stage_5_mode: 'one_shot',
   // Stage-2 collection knobs
