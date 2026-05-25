@@ -13,10 +13,16 @@ from fastapi import WebSocket
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.app import create_app  # noqa: E402
+from core.cmbagent_patch import apply_cmbagent_message_limit_patch  # noqa: E402
 from core.logging import get_logger  # noqa: E402
 from execution import console_capture  # noqa: E402
 from routers import register_routers  # noqa: E402
 from websocket.events import send_ws_event  # noqa: E402
+
+# Raise cmbagent's hardcoded 25 KB per-message cap before any agent is built,
+# so the Stage-4 writer's long output is not spliced with the
+# "[content truncated: N → M chars]" banner. See core/cmbagent_patch.py.
+apply_cmbagent_message_limit_patch()
 
 ws_logger = get_logger("websocket")
 

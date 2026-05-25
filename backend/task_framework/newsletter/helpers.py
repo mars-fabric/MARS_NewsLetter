@@ -278,6 +278,18 @@ async def run_stage_4(
     config_overrides: Optional[Dict[str, Any]] = None,
     cost_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[Dict[str, Any], str, List[str]]:
+    # Default to the section-by-section path (PaperPulse pattern) — produces
+    # long, non-truncated drafts by writing each canonical section in its own
+    # small LLM call. Set ``STAGE4_SECTION_MODE=0`` to fall back to the legacy
+    # monolithic cmbagent draft.
+    if os.environ.get("STAGE4_SECTION_MODE", "1") not in ("0", "false", "no"):
+        from .stage4 import run_stage_4_sectioned
+        return await run_stage_4_sectioned(
+            work_dir=work_dir, setup=setup, curated=curated,
+            seed_companies=seed_companies, mode_override=mode_override,
+            config_overrides=config_overrides, cost_callback=cost_callback,
+        )
+
     industries = [i["industry"] for i in setup.get("industries", [])]
     sub_domains: List[str] = []
     for i in setup.get("industries", []):

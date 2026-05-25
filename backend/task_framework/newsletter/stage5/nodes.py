@@ -106,6 +106,22 @@ def _tick(state: Stage5State, node: str, start: float) -> Dict[str, Any]:
     return {"node_timings": timings}
 
 
+def _clean_bullet(text: object) -> str:
+    """Flatten any string to a single, length-capped markdown-bullet body.
+
+    Verification notes and suggestion strings are rendered as ``- {n}`` in the
+    score block. If a note happens to contain a newline (e.g. from a regex
+    capture that accidentally spanned lines), the join would break the
+    bullet block and the document body. We always collapse to one line and
+    cap at 280 chars so the score block stays well-formed even when
+    upstream producers misbehave.
+    """
+    s = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > 280:
+        s = s[:277].rstrip() + "..."
+    return s
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Input nodes
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,7 +347,9 @@ async def executive_summary_node(state: Stage5State) -> Dict[str, Any]:
         for it in top_items
     ) or "(no items flagged Top — fall back to draft for synthesis)"
 
-    draft_excerpt = draft[:8000]
+    # Stage 4 (section-by-section) now produces 60–90 KB drafts; the legacy
+    # 8 KB excerpt cut off half the content before the synthesizer saw it.
+    draft_excerpt = draft[:24000]
 
     messages = [
         {
@@ -1200,9 +1218,9 @@ async def markdown_formatter_node(state: Stage5State) -> Dict[str, Any]:
             block.extend(subs)
         suggestions = score.get("suggestions") or []
         if suggestions:
-            block.extend(["", "### Suggestions", ""] + [f"- {s}" for s in suggestions])
+            block.extend(["", "### Suggestions", ""] + [f"- {_clean_bullet(s)}" for s in suggestions])
         if notes:
-            block.extend(["", "### Verification notes", ""] + [f"- {n}" for n in notes])
+            block.extend(["", "### Verification notes", ""] + [f"- {_clean_bullet(n)}" for n in notes])
         final_with_score = body.rstrip() + "\n" + "\n".join(block) + "\n"
 
     return {
@@ -1383,8 +1401,8 @@ async def critic_node(state: Stage5State) -> Dict[str, Any]:
             "Return only the JSON schema."
         )},
         {"role": "user", "content": (
-            "## Curated ground truth (first 6000 chars)\n" + curated[:6000] + "\n\n"
-            "## Newsletter draft (first 9000 chars)\n" + draft[:9000] + "\n\n"
+            "## Curated ground truth (first 12000 chars)\n" + curated[:12000] + "\n\n"
+            "## Newsletter draft (first 30000 chars)\n" + draft[:30000] + "\n\n"
             "Find up to 10 corrections. Be specific about which section."
         )},
     ]
@@ -1523,14 +1541,25 @@ async def editor_node(state: Stage5State) -> Dict[str, Any]:
         {"role": "user", "content": (
             f"## Critic corrections\n{corrections_block}\n\n"
             f"## DDGS supplementary evidence\n{ddgs_block}\n\n"
-            f"## Curated ground-truth excerpt (first 6000 chars)\n{curated[:6000]}\n\n"
+            f"## Curated ground-truth excerpt (first 12000 chars)\n{curated[:12000]}\n\n"
             f"## Draft (apply edits to this — do not truncate)\n{draft}\n"
         )},
     ]
 
+    # Editor budget must cover the full long-form draft. The section-by-section
+    # Stage 4 path produces 60–90 KB drafts, which is ~20–25 k tokens of output
+    # plus the surgically-edited diff regions; allow 32 k completion tokens
+    # (configurable via STAGE5_EDITOR_MAX_TOKENS). The regression guard in
+    # report_assembly_node still rejects editor output that loses content, so a
+    # too-low budget would silently fall back to the draft — set this high.
+    import os as _os
+    try:
+        editor_max_tokens = int(_os.getenv("STAGE5_EDITOR_MAX_TOKENS", "32000"))
+    except ValueError:
+        editor_max_tokens = 32000
     cost_events = list(state.get("cost_events") or [])
     try:
-        content, usage = await acomplete(messages=messages, temperature=0.1, max_tokens=12000)
+        content, usage = await acomplete(messages=messages, temperature=0.1, max_tokens=editor_max_tokens)
         if usage:
             cost_events.append({"node": "editor_node", **usage})
     except Exception as exc:  # noqa: BLE001

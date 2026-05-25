@@ -135,36 +135,77 @@ def verify_and_clean(
     #    wrapped the visible text in ``~~strikethrough~~`` which renders as a
     #    visual artifact in the PDF — clients see crossed-out text in their
     #    final newsletter. Now we keep the visible text plain and unmarked.
+    #
+    # Regex correctness — critical: ``[^)]+`` was being used for the URL
+    # portion, but ``.`` and ``[^)]`` both match newlines in Python's default
+    # mode, so a markdown link missing its closing ``)`` (which happens when
+    # Stage 4 hits max_tokens mid-link) made the regex span entire SECTIONS
+    # looking for the next ``)``. The captured "URL" then contained section
+    # headings, bullet points, blank lines — whole-document content. That
+    # content was dumped into a ``Stripped URL ...`` verification note and
+    # *removed* from the body, gutting whatever sections came after the
+    # broken link. The fix is to forbid whitespace (including newlines)
+    # inside the URL portion and inside the link text portion of markdown
+    # links — well-formed links never contain those, and broken/truncated
+    # links should simply not match at all.
     if allowed_urls:
+        def _url_in_allowlist(url: str) -> bool:
+            return url in allowed_urls or any(url.startswith(a) for a in allowed_urls)
+
+        def _record_strip(message: str) -> None:
+            # Always single-line — verification-note rendering joins each
+            # note as a bullet, and a multi-line note would break the block.
+            notes.append(message.replace("\n", " ").replace("\r", " ").strip()[:240])
+
         def _drop_unknown(match: re.Match) -> str:
             url = match.group(2).rstrip(".,;:!?'\"]>")
-            if url in allowed_urls or any(url.startswith(a) for a in allowed_urls):
+            if _url_in_allowlist(url):
                 return match.group(0)
-            notes.append(f"Stripped URL not in curated set: {url}")
+            _record_strip(f"Stripped URL not in curated set: {url}")
             return match.group(1)  # keep the visible text only — clean removal
 
-        text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _drop_unknown, text)
+        # Restrict both link text and URL to a single line: ``[^\]\n]`` and
+        # ``[^)\s]``. Stage 4 outputs well-formed links on a single line; if
+        # one isn't (because a section was truncated mid-link), we leave the
+        # half-written link alone instead of swallowing the rest of the doc.
+        text = re.sub(
+            r"\[([^\]\n]+)\]\((https?://[^)\s\n]+)\)",
+            _drop_unknown,
+            text,
+        )
 
         # Also catch bare ``<https://...>`` and naked ``https://...`` not in
         # the allow-set. Replace bare-tag versions with empty string; remove
         # naked URLs (rare, but happens when the LLM forgets the markdown link).
         def _drop_bare_tag(match: re.Match) -> str:
             url = match.group(1).rstrip(".,;:!?'\"]>")
-            if url in allowed_urls or any(url.startswith(a) for a in allowed_urls):
+            if _url_in_allowlist(url):
                 return match.group(0)
-            notes.append(f"Removed bare-tag URL not in curated set: {url}")
+            _record_strip(f"Removed bare-tag URL not in curated set: {url}")
             return ""
 
-        text = re.sub(r"<(https?://[^>]+)>", _drop_bare_tag, text)
+        text = re.sub(r"<(https?://[^>\s\n]+)>", _drop_bare_tag, text)
 
         def _drop_naked(match: re.Match) -> str:
             url = match.group(0).rstrip(".,;:!?'\"]>")
-            if url in allowed_urls or any(url.startswith(a) for a in allowed_urls):
+            if _url_in_allowlist(url):
                 return match.group(0)
-            notes.append(f"Removed naked URL not in curated set: {url}")
+            _record_strip(f"Removed naked URL not in curated set: {url}")
             return ""
 
-        text = re.sub(r"https?://[^\s)\]<>\"']+", _drop_naked, text)
+        text = re.sub(r"https?://[^\s)\]<>\"'\n]+", _drop_naked, text)
+
+    # 2b. Trim broken half-written markdown links (``[text](https://...`` with
+    #     no closing ``)``). These are the only remaining residue from
+    #     truncated Stage-4 sections after the canonical link regex passes
+    #     them over. Leaving them in the body shows up as a stray ``(`` in
+    #     the rendered output and confuses the reader; cleaner to drop the
+    #     half-written link target and keep the visible text.
+    text = re.sub(
+        r"\[([^\]\n]+)\]\(\s*https?://[^)\s\n]*\s*(?=\n|$)",
+        lambda m: m.group(1),
+        text,
+    )
 
     # 3. Soften superlatives.
     for pat in _SUPERLATIVES:
@@ -172,14 +213,22 @@ def verify_and_clean(
             text = re.sub(pat, "notable", text, flags=re.IGNORECASE)
             notes.append(f"Softened superlative `{pat}` → `notable`.")
 
-    # 4. Ensure all 22 canonical sections are present. Heading normalisation
-    #    above already restored canonical names for any thematically renamed
-    #    sections, so a section still missing here is genuinely absent and we
-    #    append a stub. Stubs are inserted in canonical order at the *end* of
-    #    the document — the editor (or operator) can move them inline later.
+    # 4. Ensure all 22 canonical sections are present. A section is considered
+    #    "present" if EITHER:
+    #      a) the canonical heading text (or its thematic variant) appears
+    #         under a ``## [N. ]`` heading, OR
+    #      b) the numeric position (``## N.``) appears in the document — the
+    #         heading text may have been thematically renamed by the editor
+    #         or partially mangled by a downstream pass, but the slot exists.
+    #    Without (b) the previous version produced phantom-stub duplicates
+    #    when the URL stripper bug ate a section's body but left its heading
+    #    in place. We now only stub when both checks fail.
     for idx, section in enumerate(_REQUIRED_SECTIONS, start=1):
-        pattern = rf"^#{{1,3}}\s+(?:\d+\.\s+)?{re.escape(section)}\b"
-        if not re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE):
+        name_pattern = rf"^#{{1,3}}\s+(?:\d+\.\s+)?{re.escape(section)}\b"
+        slot_pattern = rf"^##\s+{idx}\.\s+"
+        has_name = re.search(name_pattern, text, flags=re.MULTILINE | re.IGNORECASE)
+        has_slot = re.search(slot_pattern, text, flags=re.MULTILINE)
+        if not (has_name or has_slot):
             text += f"\n\n## {idx}. {section}\n\n_(no in-window material — to monitor next period)_\n"
             notes.append(f"Added missing canonical section: {section}.")
 
