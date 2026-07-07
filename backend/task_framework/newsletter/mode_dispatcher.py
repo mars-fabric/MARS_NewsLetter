@@ -33,6 +33,103 @@ from models.newsletter_schemas import CmbAgentMode
 
 logger = get_logger(__name__)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cmbagent hardening: the upstream `plan_setter` tool signature declares
+# `needed_agents: List[Literal["engineer","researcher","idea_maker",
+# "idea_hater","camb_context","aas_keyword_finder"]]`, so the LLM planner
+# frequently requests `camb_context` / `aas_keyword_finder` even on a general
+# newsletter task where those agents don't exist. Upstream then calls
+# `cmbagent_instance.get_agent_object_from_name(agent)` inside
+# `build_agent_instructions`, which prints an error and does `sys.exit()` on
+# an unknown agent. `SystemExit` is a `BaseException` and escapes past
+# `asyncio.to_thread`, killing the uvicorn worker and every in-flight task.
+#
+# We fix this once, at import time, by monkey-patching
+# `cmbagent.functions.planning.build_agent_instructions` to silently drop
+# unknown agents instead of exiting. Idempotent: only patches on first import.
+# ──────────────────────────────────────────────────────────────────────────────
+_CMBAGENT_HARDENING_APPLIED = False
+
+
+def _apply_cmbagent_hardening() -> None:
+    global _CMBAGENT_HARDENING_APPLIED
+    if _CMBAGENT_HARDENING_APPLIED:
+        return
+    try:
+        from cmbagent.functions import planning as _planning  # type: ignore
+    except Exception as exc:  # pragma: no cover — best-effort
+        logger.debug("cmbagent_hardening_skipped_import_failed", error=str(exc))
+        _CMBAGENT_HARDENING_APPLIED = True
+        return
+
+    def _hardened_build_agent_instructions(cmbagent_instance, needed_agents):
+        # Filter out agents that don't exist on this instance, silently — the
+        # planner LLM occasionally hallucinates `camb_context` /
+        # `aas_keyword_finder` on non-cosmology tasks and the upstream call
+        # `sys.exit()`s if we hand them through.
+        known: list = []
+        for name in needed_agents or []:
+            try:
+                obj = cmbagent_instance.get_agent_object_from_name(name)
+            except SystemExit:
+                logger.warning("cmbagent_dropped_unknown_agent_from_plan", agent=name)
+                continue
+            if obj is None:
+                logger.warning("cmbagent_dropped_unknown_agent_from_plan", agent=name)
+                continue
+            known.append(name)
+
+        if not known:
+            # Never leave the planner with zero agents — fall back to the
+            # workhorse pair that every workflow supports.
+            known = ["engineer", "researcher"]
+            logger.warning("cmbagent_planner_agent_list_empty_defaulted_to_engineer_researcher")
+
+        header = f"The plan must strictly involve only the following agents: {', '.join(known)}\n"
+        body = r"""
+**AGENT ROLES AND INSTRUCTIONS**
+Here are the agents that are needed to carry out the plan, along with their full instructions.
+When creating sub-task instructions, you MUST respect each agent's constraints and conventions described below.
+Do NOT specify implementation details that conflict with the agent's instructions (e.g., don't specify absolute paths if the agent uses relative paths, don't specify variable names, etc.).
+Focus on WHAT should be accomplished, not HOW the agent should implement it.
+
+You must carefully check that the sub-taskinstructions proposed for each agent are consistent with the agent's instructions and rules.
+
+"""
+        for agent in set(known):
+            try:
+                agent_object = cmbagent_instance.get_agent_object_from_name(agent)
+            except SystemExit:
+                continue
+            if agent_object is None:
+                continue
+            info = getattr(agent_object, "info", {}) or {}
+            body += (
+                f"\n---\n**Agent: {agent}**\n"
+                f"**Description:** {info.get('description', 'No description available.')}\n"
+                f"**Full Agent Instructions:**\n"
+                f"{info.get('instructions', 'No instructions available.')}\n---\n"
+            )
+        body += r"""
+You must not invoke any other agent than the ones listed above.
+
+**IMPORTANT PLANNING GUIDELINES:**
+- Keep sub-task instructions high-level (WHAT to do, not HOW)
+- Do NOT specify exact variable names, function names, or code snippets
+- Do NOT specify exact file paths - let the agent decide based on its conventions
+- Do NOT specify exact library calls or API usage
+- Focus on the goal and expected outputs, not implementation details
+"""
+        return header + body
+
+    _planning.build_agent_instructions = _hardened_build_agent_instructions
+    _CMBAGENT_HARDENING_APPLIED = True
+    logger.info("cmbagent_hardening_applied", patched="build_agent_instructions")
+
+
+_apply_cmbagent_hardening()
+
 # Map our internal field name → cmbagent kwarg name. ``one_shot`` accepts a
 # narrower set than ``planning_and_control``; planning-specific roles are
 # silently dropped in one-shot mode.
@@ -252,7 +349,13 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
                         iteration_limits: Dict[str, Any],
                         fallback_max_rounds: int,
                         callbacks: Any = None) -> str:
-    """Invoke ``cmbagent.one_shot`` via to_thread (cmbagent is sync)."""
+    """Invoke ``cmbagent.one_shot`` via to_thread (cmbagent is sync).
+
+    ``enable_ag2_free_tools=True`` is set unconditionally so DDGS, Wikipedia,
+    ArXiv and the other free LangChain/CrewAI web-search tools are wired
+    into the researcher agent. Without it, the researcher cannot actually
+    reach the web and Stage 2/3/4 collapse into hallucinated content.
+    """
     import asyncio
     import cmbagent
 
@@ -262,6 +365,7 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
             "agent": agent,
             "work_dir": work_dir,
             "max_rounds": fallback_max_rounds,
+            "enable_ag2_free_tools": True,
             **_map_kwargs(model_overrides, _ONE_SHOT_MODEL_MAP),
             **_map_kwargs(iteration_limits, _ONE_SHOT_LIMIT_MAP),
         }
@@ -294,6 +398,10 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
         kwargs: Dict[str, Any] = {
             "task": prompt,
             "work_dir": work_dir,
+            # DDGS + LangChain + CrewAI free tools — same rationale as the
+            # one_shot path. In planning_and_control the researcher agent is
+            # the primary consumer of web search.
+            "enable_ag2_free_tools": True,
             **_map_kwargs(model_overrides, _PLANNING_MODEL_MAP),
             **_map_kwargs(iteration_limits, _PLANNING_LIMIT_MAP),
         }
@@ -305,7 +413,23 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
             kwargs["engineer_instructions"] = engineer_instructions
         if callbacks is not None:
             kwargs["callbacks"] = callbacks
-        return planning_and_control_context_carryover(**kwargs)
+        # cmbagent's `get_agent_object_from_name` calls `sys.exit()` when the
+        # planner hallucinates a non-existent agent (e.g. `camb_context`,
+        # `aas_keyword_finder` in a general-purpose newsletter task).
+        # `SystemExit` is a `BaseException`, so if we don't catch it here it
+        # propagates past `asyncio.to_thread`, escapes the FastAPI request
+        # handler, and kills the uvicorn worker — taking every in-flight
+        # task down with it. Trap it and re-raise as a normal RuntimeError so
+        # the stage fails cleanly and the server keeps serving.
+        try:
+            return planning_and_control_context_carryover(**kwargs)
+        except SystemExit as exc:
+            raise RuntimeError(
+                f"cmbagent planning_and_control aborted via sys.exit(): {exc!r}. "
+                "This usually means the plan_setter agent requested an "
+                "unknown agent name via set_plan_constraints \u2014 check the "
+                "stage console log for the offending needed_agents list."
+            ) from exc
 
     result = await asyncio.to_thread(_call)
     return _extract_text(result, agent=agent)

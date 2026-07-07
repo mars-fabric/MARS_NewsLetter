@@ -1,15 +1,37 @@
+# ─── FastAPI / server stack ────────────────────────────────────────────────
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.5
 python-dotenv>=1.0
 structlog>=24.1
-httpx>=0.27
-aiofiles>=23.2
 python-multipart>=0.0.9
-weasyprint>=62.0
-fpdf2>=2.7
+aiofiles>=23.2
+
+# ─── HTTP clients ──────────────────────────────────────────────────────────
+httpx>=0.27          # async client + enterprise-gateway http_client
+requests>=2.31       # sync client used by the enterprise-gateway TokenManager
+
+# ─── LLM providers (direct SDKs; picked up by mars_cmbagent) ───────────────
+openai>=1.40
+anthropic>=0.30
+litellm>=1.50
+ag2[openai]>=0.10.3  # AG2 (autogen fork) used by cmbagent
+
+# ─── Workflow / graph ──────────────────────────────────────────────────────
+langgraph>=0.2
+
+# ─── Content processing ────────────────────────────────────────────────────
 markdown>=3.6
+markdownify>=1.0
 beautifulsoup4>=4.12
 tldextract>=5.1
-mars-cmbagent==1.1.5
-langgraph>=0.2
+
+# ─── PDF export ────────────────────────────────────────────────────────────
+weasyprint>=62.0
+fpdf2>=2.7
+
+# ─── mars_cmbagent (multi-agent core) ──────────────────────────────────────
+# Install from a local editable checkout during development:
+#   pip install -e /path/to/mars_cmbagent[enterprise_gateway]
+# Or pin a released version once published:
+mars-cmbagent>=2.2.0

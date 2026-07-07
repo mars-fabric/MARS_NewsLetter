@@ -1,19 +1,17 @@
 """Canonical 22-section spec + per-section prompt builder.
 
-The numeric ordering, heading text, and per-section guidance must stay in sync
-with:
-  * ``prompts/stages.py`` writer prompt
-  * ``helpers._CANONICAL_22_HELPERS``
-  * ``stage5/nodes.py _CANONICAL_22``
-
-Keeping a single source of truth here would require a cross-package import in
-helpers, so we accept the duplication and rely on tests to keep them aligned.
+Section *names* live in :mod:`..constants` (single source of truth). This
+module owns the per-section drafting *guidance* — word budgets, sub-section
+shape, citation rules — everything the Stage-4 writer needs but that is not
+useful to Stage-5 verifiers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
+
+from ..constants import CANONICAL_HEADINGS as _NAMES
 
 
 @dataclass(frozen=True)
@@ -24,159 +22,180 @@ class SectionSpec:
     target_words: int       # rough word budget (used to tune max_tokens)
 
 
-# Canonical 22-section specification — heading text and per-section guidance.
-CANONICAL_SECTIONS: List[SectionSpec] = [
-    SectionSpec(
-        1, "Newsletter Metadata",
+# Full-form heading for slot 4 — the writer emits "TL;DR — Key Takeaways" so
+# the section spec uses that form. Verifiers substring-match against the
+# shorter "TL;DR" name from ``constants`` and both forms satisfy the check.
+_HEADING_OVERRIDES = {4: "TL;DR — Key Takeaways"}
+
+
+def _heading(idx: int) -> str:
+    return _HEADING_OVERRIDES.get(idx, _NAMES[idx - 1])
+
+
+# Per-section drafting guidance (word budget + shape). Order MUST match
+# constants.CANONICAL_HEADINGS position-for-position.
+_GUIDANCE: List[tuple[str, int]] = [
+    # 1 Newsletter Metadata
+    (
         "Render metadata as a tight bullet list: Title, Subtitle, Edition (V1), "
         "Date Range, Publication Date (today), Audience. No citations needed.",
         80,
     ),
-    SectionSpec(
-        2, "Editor's Note",
+    # 2 Editor's Note
+    (
         "Write a 4–6 sentence editorial framing for the period. Lead with what is "
         "most important this edition and why the audience should read on. Cite the "
         "single most representative source inline.",
         150,
     ),
-    SectionSpec(
-        3, "Executive Summary",
+    # 3 Executive Summary
+    (
         "Write a 5–8 sentence prose synthesis (no bullets) covering the period's "
         "most important developments. Every factual claim is followed by an inline "
         "[domain](url) citation drawn from the curated allow-list.",
         220,
     ),
-    SectionSpec(
-        4, "TL;DR — Key Takeaways",
+    # 4 TL;DR — Key Takeaways
+    (
         "Emit 5–8 markdown bullets. Each bullet is one sentence, names a specific "
         "event/company, and ends with an inline [domain](url) citation.",
         180,
     ),
-    SectionSpec(
-        5, "Industry & Subdomain Focus",
+    # 5 Industry & Subdomain Focus
+    (
         "One paragraph (3–5 sentences) stating exactly which industries and "
         "sub-domains this edition covers and what falls outside scope.",
         120,
     ),
-    SectionSpec(
-        6, "Top Story of the Period",
+    # 6 Top Story of the Period
+    (
         "Sub-sections: **Summary** (3–5 sentences), **Why it matters** (3–5 "
         "sentences), **Source(s)** (bullet list with [domain](url) citations). "
         "Pick the single most significant story from the curated set.",
         320,
     ),
-    SectionSpec(
-        7, "Secondary Major Story",
+    # 7 Secondary Major Story
+    (
         "Same shape as Top Story — Summary / Impact / Source(s). Pick the second "
         "most significant story from the curated set, distinct from the Top Story.",
         300,
     ),
-    SectionSpec(
-        8, "Other Notable Headlines",
+    # 8 Other Notable Headlines
+    (
         "Bulleted list of 6–12 headlines. Each bullet: one sentence, names the "
         "company/event, ends with an inline [domain](url) citation. Sort by "
         "Top: yes flags first, then combined Relevance/Authority/Freshness score.",
         320,
     ),
-    SectionSpec(
-        9, "Subdomain Highlights",
+    # 9 Subdomain Highlights
+    (
         "Three sub-sections (`### Highlight #1`, `### Highlight #2`, `### Highlight #3`). "
         "Each highlight has **Details** (2–4 sentences) and **Source** "
         "([domain](url)). Pick the most important development per sub-domain.",
         350,
     ),
-    SectionSpec(
-        10, "Releases & Announcements",
+    # 10 Releases & Announcements
+    (
         "Three sub-sections — `### Product / Platform Releases`, "
         "`### Feature Updates`, `### Research / Whitepapers`. Each lists 2–5 "
         "bullets with inline citations.",
         320,
     ),
-    SectionSpec(
-        11, "Trend Intelligence",
+    # 11 Trend Intelligence
+    (
         "Three sub-sections — `### Emerging Trends`, `### Declining or Saturating "
         "Trends`, `### Market or Ecosystem Signals`. Each lists 2–4 short paragraphs "
         "or bullets, citing sources inline.",
         320,
     ),
-    SectionSpec(
-        12, "Audience-Centric Analysis",
+    # 12 Audience-Centric Analysis
+    (
         "Three sub-sections — `### What This Means for <audience>`, "
         "`### Opportunities`, `### Risks & Challenges`. Each gives 3–5 implication-"
         "led bullets with inline citations.",
         320,
     ),
-    SectionSpec(
-        13, "Focus Topic Deep Dive",
+    # 13 Focus Topic Deep Dive
+    (
         "Three sub-sections — `### Background & Context`, "
         "`### What Changed in This Date Range`, `### Implications`. This is the "
         "longest section in the newsletter (400–550 words). Pick the topic the "
         "analyst outline flagged for deep treatment.",
         500,
     ),
-    SectionSpec(
-        14, "Source-Driven Insights",
+    # 14 Source-Driven Insights
+    (
         "Three sub-sections — `### Insights from Web Search Sources`, "
         "`### Insights from User-Provided Links`, `### Cross-Source Comparison`. "
         "User-supplied URLs (if any) MUST appear inline as citations here.",
         320,
     ),
-    SectionSpec(
-        15, "Data & Evidence",
-        "Two sub-sections — `### Key Data Points`, `### Statistics Snapshot`. List "
-        "2–5 numbers each with the source the figure was published in. Never "
-        "invent a number — if the curated set has no figures, say so explicitly.",
-        220,
+    # 15 Data & Evidence
+    (
+        "Two sub-sections — `### Key Data Points`, `### Statistics Snapshot`. "
+        "Extract 4–8 concrete figures from the curated snippets (percentages, "
+        "dollar amounts, model sizes, release counts, benchmark scores, adoption "
+        "rates). Format each as `- **<figure>** — <one-sentence context> "
+        "[domain](url)`. Never invent a number — if the curated set has fewer "
+        "than 4 figures, list what is available and add one line noting the gap.",
+        260,
     ),
-    SectionSpec(
-        16, "Quotes & Opinions",
+    # 16 Quotes & Opinions
+    (
         "Two sub-sections — `### Notable Quotes` and `### Expert Commentary "
         "Summary`. Each quote must be reported (not fabricated); if no direct "
         "quote is available in the curated snippets, paraphrase the analyst's "
         "position and cite the source.",
         220,
     ),
-    SectionSpec(
-        17, "Tools & Resources",
+    # 17 Tools & Resources
+    (
         "Three sub-sections — `### Tools Mentioned`, `### Recommended Reading`, "
         "`### Documentation & References`. Bullets with [domain](url) citations.",
         220,
     ),
-    SectionSpec(
-        18, "Action & Utility",
+    # 18 Action & Utility
+    (
         "Three sub-sections — `### Recommended Actions`, "
         "`### Strategic Considerations`, `### Watchlist Items`. Each gives 3–5 "
         "concise bullets framed for the audience.",
         260,
     ),
-    SectionSpec(
-        19, "Forward-Looking Intelligence",
+    # 19 Forward-Looking Intelligence
+    (
         "Two sub-sections — `### Signals for the Next Period` and "
         "`### Predictions`. Predictions must be marked as predictive and tied to "
         "specific signals in the curated set.",
         220,
     ),
-    SectionSpec(
-        20, "Transparency & Methodology",
+    # 20 Transparency & Methodology
+    (
         "Four sub-sections — `### Source Collection Method`, `### Source List`, "
         "`### Content Selection Criteria`, `### AI Generation Notes`. The Source "
         "List enumerates the top domains cited in this edition.",
         260,
     ),
-    SectionSpec(
-        21, "Compliance & Trust",
+    # 21 Compliance & Trust
+    (
         "Two sub-sections — `### Bias & Limitations Disclosure` and `### Disclaimer`. "
         "Disclose any known bias in source mix (e.g. vendor blogs vs. independent "
         "press), and add a standard AI-newsletter disclaimer.",
         180,
     ),
-    SectionSpec(
-        22, "Closure",
+    # 22 Closure
+    (
         "Two sub-sections — `### Next Edition Preview` (what we will watch in the "
         "following period) and `### Newsletter Footer` (industry · sub-domain · "
         "date range · 'Generated by AI' · version).",
         150,
     ),
+]
+
+assert len(_GUIDANCE) == 22, "Guidance list must cover all 22 sections."
+
+CANONICAL_SECTIONS: List[SectionSpec] = [
+    SectionSpec(number=i, heading=_heading(i), guidance=g, target_words=w)
+    for i, (g, w) in enumerate([g for g in _GUIDANCE], start=1)
 ]
 
 

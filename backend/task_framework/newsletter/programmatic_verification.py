@@ -25,61 +25,18 @@ import json
 import re
 from typing import Any, Dict, List, Set, Tuple
 
-# 22 top-level sections — these mirror the section list emitted by Stage 4's
-# writer prompt (`generation_writer_prompt`). The verifier inserts a stub if
-# the editor accidentally drops one.
-_REQUIRED_SECTIONS = (
-    "Newsletter Metadata",
-    "Editor's Note",
-    "Executive Summary",
-    "TL;DR",
-    "Industry & Subdomain Focus",
-    "Top Story of the Period",
-    "Secondary Major Story",
-    "Other Notable Headlines",
-    "Subdomain Highlights",
-    "Releases & Announcements",
-    "Trend Intelligence",
-    "Audience-Centric Analysis",
-    "Focus Topic Deep Dive",
-    "Source-Driven Insights",
-    "Data & Evidence",
-    "Quotes & Opinions",
-    "Tools & Resources",
-    "Action & Utility",
-    "Forward-Looking Intelligence",
-    "Transparency & Methodology",
-    "Compliance & Trust",
-    "Closure",
-)
+from .constants import CANONICAL_HEADINGS
 
-# Canonical heading text (full ``## N. <Title>`` form) by position, used to
-# normalise the editor's headings when it renames or thematically retitles
-# numbered sections. This mirrors the writer-prompt list verbatim — keep the
-# two in sync when sections are renamed.
-_CANONICAL_HEADINGS: tuple[str, ...] = (
-    "Newsletter Metadata",
-    "Editor's Note",
-    "Executive Summary",
-    "TL;DR — Key Takeaways",
-    "Industry & Subdomain Focus",
-    "Top Story of the Period",
-    "Secondary Major Story",
-    "Other Notable Headlines",
-    "Subdomain Highlights",
-    "Releases & Announcements",
-    "Trend Intelligence",
-    "Audience-Centric Analysis",
-    "Focus Topic Deep Dive",
-    "Source-Driven Insights",
-    "Data & Evidence",
-    "Quotes & Opinions",
-    "Tools & Resources",
-    "Action & Utility",
-    "Forward-Looking Intelligence",
-    "Transparency & Methodology",
-    "Compliance & Trust",
-    "Closure",
+# Aliases for the two historic names used inside this module. Both point at
+# the same authoritative tuple in ``constants.py`` — kept as module-local
+# names to minimise diffs against the rest of the file. The full
+# "TL;DR — Key Takeaways" heading used by the normaliser is preserved by
+# overriding position 4 below (verifier substring-matching works on both
+# forms but the normaliser rewrites headings to the fully-qualified form).
+_REQUIRED_SECTIONS: Tuple[str, ...] = CANONICAL_HEADINGS
+_CANONICAL_HEADINGS: Tuple[str, ...] = tuple(
+    "TL;DR — Key Takeaways" if h == "TL;DR" else h
+    for h in CANONICAL_HEADINGS
 )
 
 _SUPERLATIVES = (
@@ -252,7 +209,21 @@ def verify_and_clean(
             text += f"\n\n## {idx}. {section}\n\n_(no in-window material — to monitor next period)_\n"
             notes.append(f"Added missing canonical section: {section}.")
 
-    return text, notes
+    # Deduplicate notes while preserving first-seen order. The URL stripper
+    # runs once per markdown-link occurrence, so a single dead URL that is
+    # cited (say) 20 times produces 20 identical ``Stripped URL ...`` notes.
+    # That noise floods the ``Verification notes`` section of the final
+    # newsletter and the ``verification_notes.md`` artifact. Collapse to
+    # one entry per unique message — the count is not information-bearing.
+    seen: set = set()
+    deduped: List[str] = []
+    for n in notes:
+        if n in seen:
+            continue
+        seen.add(n)
+        deduped.append(n)
+
+    return text, deduped
 
 
 def _normalise_canonical_headings(text: str) -> Tuple[str, List[str]]:

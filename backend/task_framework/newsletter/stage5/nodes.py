@@ -1,18 +1,24 @@
 """All 22 LangGraph nodes for Stage 5.
 
-Status legend (in docstrings):
-  * IMPLEMENTED — fully working
-  * STUB        — typed scaffold returning state untouched; replace before prod
-
 Each node is an async function ``(state: Stage5State) -> dict``. The returned
 dict is merged into the state by LangGraph. Returning ``{}`` means "no change".
 
-The four nodes the user prioritized for first-pass implementation are:
-  * executive_summary_node
-  * section_writer_node
-  * aggregate_score_node
-  * dashboard_metrics_node
-Everything else is a STUB that future iterations will fill in.
+Node topology is defined in :mod:`.graph` (see the ASCII diagram in its
+docstring). Nodes fall into four bands:
+
+  1. **Load / merge** — pull Stage 3 (curated) and Stage 4 (draft) content
+     into typed ``ContentItem`` records, then merge and group them.
+  2. **Extraction** — cluster by topic, extract insights, synthesise the
+     executive summary.
+  3. **Evaluation + Critique** — a six-evaluator fan-out (relevance / diversity
+     / credibility / freshness / redundancy / coverage) → aggregate score →
+     sequential critique (missing topics / bias / info loss / improvement).
+  4. **Assembly / output** — optional regenerate weak sections, run the
+     deterministic ``verify_and_clean`` safety net, assemble the report,
+     compute dashboard metrics, format markdown, render PDF.
+
+The 22 canonical section names live in ``..constants.CANONICAL_HEADINGS`` and
+are re-exported here as ``_CANONICAL_22`` for readability.
 """
 
 from __future__ import annotations
@@ -71,6 +77,47 @@ _DOMAIN_TIER: Dict[str, str] = {
     # --- Standards / regulator (tier=official) ---
     "nist.gov": "official", "cisa.gov": "official", "europa.eu": "official",
     "iso.org": "official", "ieee.org": "official", "w3.org": "official",
+    "fda.gov": "official", "ema.europa.eu": "official",
+    "ec.europa.eu": "official", "who.int": "official",
+    "eia.gov": "official", "energy.gov": "official", "iea.org": "official",
+    "epa.gov": "official", "noaa.gov": "official",
+    "fcc.gov": "official", "3gpp.org": "official", "etsi.org": "official",
+    "itu.int": "official",
+    # --- Telecom / 5G vendors (tier=official) ---
+    "ericsson.com": "official", "nokia.com": "official",
+    "qualcomm.com": "official", "huawei.com": "official",
+    "samsung.com": "official", "verizon.com": "official",
+    "att.com": "official", "about.att.com": "official",
+    "t-mobile.com": "official", "vodafone.com": "official",
+    "deutschetelekom.com": "official", "cisco.com": "official",
+    "newsroom.intel.com": "official", "intel.com": "official",
+    # --- Energy / utility vendors (tier=official) ---
+    "shell.com": "official", "bp.com": "official",
+    "exxonmobil.com": "official", "totalenergies.com": "official",
+    "siemens-energy.com": "official", "siemens.com": "official",
+    "ge.com": "official", "gevernova.com": "official",
+    "abb.com": "official", "schneider-electric.com": "official",
+    "ge-vernova.com": "official", "vestas.com": "official",
+    "orsted.com": "official", "iberdrola.com": "official",
+    "nexteraenergy.com": "official", "duke-energy.com": "official",
+    "edpr.com": "official", "enel.com": "official",
+    "tesla.com": "official", "rivian.com": "official",
+    # --- Pharma giants (tier=official) ---
+    "pfizer.com": "official", "moderna.com": "official",
+    "novartis.com": "official", "roche.com": "official",
+    "merck.com": "official", "msd.com": "official",
+    "jnj.com": "official", "astrazeneca.com": "official",
+    "gsk.com": "official", "sanofi.com": "official",
+    "bayer.com": "official", "lilly.com": "official",
+    "abbvie.com": "official", "bms.com": "official",
+    "amgen.com": "official", "biogen.com": "official",
+    "regeneron.com": "official", "vertex.com": "official",
+    "takeda.com": "official", "novonordisk.com": "official",
+    # --- Health/medical authority (tier=authority) ---
+    "nih.gov": "authority", "cdc.gov": "authority",
+    "nejm.org": "authority", "thelancet.com": "authority",
+    "bmj.com": "authority", "jamanetwork.com": "authority",
+    "biorxiv.org": "authority", "medrxiv.org": "authority",
     # --- Major press / authority (tier=authority, weight=85) ---
     "reuters.com": "authority", "wsj.com": "authority", "ft.com": "authority",
     "bloomberg.com": "authority", "nature.com": "authority",
@@ -740,16 +787,43 @@ async def diversity_scoring_node(state: Stage5State) -> Dict[str, Any]:
 async def credibility_scoring_node(state: Stage5State) -> Dict[str, Any]:
     """IMPLEMENTED: rate credibility tier of cited sources.
 
-    Deterministic core (allowlist tier weights) + URL-reachability bonus from
-    ``url_verification`` results when present. No LLM call — the tier table
-    plus reachability is enough signal here and saves a round-trip.
+    Tier resolution uses the new three-layer ``domain_classifier``:
+
+      1. Static ``_DOMAIN_TIER`` table  → known top-tier vendors / regulators
+      2. Deterministic rules            → ``.gov``/``.edu``/``.int``/``.mil``
+                                          + ``blog.``/``news.``/``press.``
+                                          subdomain prefixes + trade-press hints
+      3. LLM classifier (cached on disk)→ batch-classifies anything still
+                                          unknown, caches each result so
+                                          subsequent runs hit the cache
+
+    Final score = ``0.7 * tier_base + 0.3 * reachability_pct``. The shift
+    from 0.2 → 0.3 reachability weight means a newsletter whose sources all
+    verify live gets meaningful credibility lift from that signal alone.
     """
     start = time.time()
-    items = state.get("items") or []
-    verification = state.get("dashboard_metrics", {}) if False else state.get("url_verification") or {}
+    from ..domain_classifier import resolve_domain_tiers
 
-    tier_weights = {"official": 100, "authority": 85, "neutral": 60, "unknown": 40}
+    items = state.get("items") or []
+    verification = state.get("url_verification") or {}
+    setup = state.get("setup") or {}
+    industry_names = [i.get("industry") for i in setup.get("industries", []) if i.get("industry")]
+
+    # Collect every distinct domain we cite.
+    domains: List[str] = []
+    for it in items:
+        d = (it.get("domain") or _domain_of(it.get("url", ""))).lower().lstrip("www.")
+        if d:
+            domains.append(d)
+
+    # Three-layer classifier — static → deterministic → cached-LLM.
+    tier_map, source_map = await resolve_domain_tiers(
+        domains, static_table=_DOMAIN_TIER, industries=industry_names,
+    )
+
+    tier_weights = {"official": 100, "authority": 85, "neutral": 60, "unknown": 45}
     tier_counts = {"official": 0, "authority": 0, "neutral": 0, "unknown": 0}
+    classify_source_counts: Dict[str, int] = {}
     per_domain: Dict[str, str] = {}
     weighted_sum = 0.0
     total = 0
@@ -757,9 +831,11 @@ async def credibility_scoring_node(state: Stage5State) -> Dict[str, Any]:
         d = (it.get("domain") or _domain_of(it.get("url", ""))).lower().lstrip("www.")
         if not d:
             continue
-        tier = _DOMAIN_TIER.get(d) or _DOMAIN_TIER.get(d.split(".", 1)[-1], "unknown")
+        tier = tier_map.get(d, "unknown")
+        src = source_map.get(d, "default")
         per_domain[d] = tier
-        tier_counts[tier] += 1
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        classify_source_counts[src] = classify_source_counts.get(src, 0) + 1
         weighted_sum += tier_weights[tier]
         total += 1
 
@@ -772,8 +848,7 @@ async def credibility_scoring_node(state: Stage5State) -> Dict[str, Any]:
         reach = [r for r in results if r.get("reachable")]
         if results:
             reach_pct = 100.0 * len(reach) / len(results)
-    # Final score = 0.8 * base + 0.2 * reachability_pct
-    score = 0.8 * base + 0.2 * reach_pct
+    score = 0.7 * base + 0.3 * reach_pct
 
     scores = dict(state.get("scores") or {})
     scores["credibility"] = {
@@ -781,9 +856,13 @@ async def credibility_scoring_node(state: Stage5State) -> Dict[str, Any]:
         "detail": {
             "tier_counts": tier_counts,
             "per_domain_tier": per_domain,
+            "classify_source_counts": classify_source_counts,
             "reachability_pct": round(reach_pct, 1),
         },
-        "notes": f"tier-weighted base {round(base,1)} + reach bonus",
+        "notes": (
+            f"tier-weighted base {round(base,1)} + reach bonus; "
+            f"tiers from {classify_source_counts}"
+        ),
     }
     return {"scores": scores, **_tick(state, "credibility_scoring_node", start)}
 
@@ -909,17 +988,8 @@ async def redundancy_detector_node(state: Stage5State) -> Dict[str, Any]:
     }
 
 
-# Canonical 22 newsletter section names — must stay in sync with the writer prompt.
-_CANONICAL_22 = (
-    "Newsletter Metadata", "Editor's Note", "Executive Summary",
-    "TL;DR", "Industry & Subdomain Focus", "Top Story of the Period",
-    "Secondary Major Story", "Other Notable Headlines", "Subdomain Highlights",
-    "Releases & Announcements", "Trend Intelligence", "Audience-Centric Analysis",
-    "Focus Topic Deep Dive", "Source-Driven Insights", "Data & Evidence",
-    "Quotes & Opinions", "Tools & Resources", "Action & Utility",
-    "Forward-Looking Intelligence", "Transparency & Methodology",
-    "Compliance & Trust", "Closure",
-)
+# Canonical 22 newsletter section names — single source of truth in constants.py.
+from ..constants import CANONICAL_HEADINGS as _CANONICAL_22  # noqa: E402
 
 
 async def coverage_checker_node(state: Stage5State) -> Dict[str, Any]:

@@ -289,6 +289,12 @@ async def run_stage_4_sectioned(
 
     mode = _stage_mode(setup, 4, mode_override)
     merged = merge_overrides(setup, 4, config_overrides)
+    # Analyst step is a pure content-transformation pass — force single-step
+    # researcher-only plan so cmbagent's planner doesn't fan out to
+    # idea_maker / idea_hater instead of producing the outline. See the note
+    # in `helpers._pin_single_step_researcher`.
+    from ..helpers import _pin_single_step_researcher, _RESEARCHER_ONLY_PLAN_INSTRUCTIONS
+    analyst_merged = _pin_single_step_researcher(merged)
     today = _today()
     cost_events: List[Dict[str, Any]] = []
 
@@ -309,7 +315,8 @@ async def run_stage_4_sectioned(
         outline = await call_llm_with_antirefusal(
             lambda p: run_ai_stage(
                 prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=merged, cost_callback=cost_callback,
+                config_overrides=analyst_merged, cost_callback=cost_callback,
+                plan_instructions=_RESEARCHER_ONLY_PLAN_INSTRUCTIONS,
                 researcher_instructions=analyst_instructions,
             ),
             primary_prompt=analyst_prompt,
