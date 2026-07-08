@@ -38,3 +38,7 @@ mars_cmbagent[all]>=2.2.1
 sqlalchemy
 langchain
 langchain_community
+statsmodels>=0.14.0
+matplotlib>=3.8.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
