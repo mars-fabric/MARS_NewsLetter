@@ -26,12 +26,27 @@ deterministic stub so the rest of the pipeline can still be exercised.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, Optional
 
 from core.logging import get_logger
 from models.newsletter_schemas import CmbAgentMode
 
 logger = get_logger(__name__)
+
+
+def _stage_timeout_seconds() -> int:
+    """Hard cap for any single AI stage call (default 240s).
+
+    Prevents stage rows from sitting in `running` forever when an upstream
+    provider/tool call stalls.
+    """
+    raw = os.getenv("NEWSLETTER_AI_STAGE_TIMEOUT_S", "240").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        return 240
+    return max(60, val)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,21 +152,19 @@ _ONE_SHOT_MODEL_MAP = {
     "model": "researcher_model",          # default agent in one_shot
     "researcher_model": "researcher_model",
     "engineer_model": "engineer_model",
-    "web_surfer_model": "web_surfer_model",
-    "formatter_model": "default_formatter_model",
     "orchestration_model": "default_llm_model",
+    "evaluator_model": "default_evaluator_model",
 }
 _PLANNING_MODEL_MAP = {
     "model": "engineer_model",            # primary executor in P&C
     "engineer_model": "engineer_model",
     "researcher_model": "researcher_model",
-    "web_surfer_model": "web_surfer_model",
     "planner_model": "planner_model",
     "plan_reviewer_model": "plan_reviewer_model",
     "idea_maker_model": "idea_maker_model",
     "idea_hater_model": "idea_hater_model",
-    "formatter_model": "default_formatter_model",
     "orchestration_model": "default_llm_model",
+    "evaluator_model": "default_evaluator_model",
 }
 
 # Iteration knob name → cmbagent kwarg name, by mode.
@@ -174,6 +187,59 @@ def _has_cmbagent() -> bool:
         return True
     except Exception:
         return False
+
+
+def _detect_default_model() -> Optional[str]:
+    """Return the best available model string from environment, so cmbagent
+    never falls back to its hardcoded Gemini defaults when Gemini is not configured.
+
+    Priority: Azure OpenAI → OpenAI → Anthropic → None (use cmbagent default).
+    """
+    import os
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+    if azure_key and azure_endpoint and azure_deployment:
+        # Ensure LiteLLM Azure env aliases are set (litellm reads AZURE_API_KEY /
+        # AZURE_API_BASE in addition to the OpenAI-SDK convention).
+        os.environ.setdefault("AZURE_API_KEY", azure_key)
+        os.environ.setdefault("AZURE_API_BASE", azure_endpoint)
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+        os.environ.setdefault("AZURE_API_VERSION", api_version)
+        return f"azure/{azure_deployment}"
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return "gpt-4o"
+    if os.getenv("ANTHROPIC_API_KEY", "").strip():
+        return "claude-3-5-sonnet-20241022"
+    return None
+
+
+def _inject_default_model(model_overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """Inject the auto-detected model for every role that isn't already overridden.
+
+    cmbagent has a hardcoded default config_list that uses Gemini models. When the
+    newsletter is configured for Azure OpenAI (and Gemini API key is absent), every
+    un-overridden role silently falls back to Gemini and then hangs on auth failures.
+    We prevent this by filling all role slots with the detected provider model.
+    """
+    default = _detect_default_model()
+    if not default:
+        return model_overrides
+    out = dict(model_overrides)
+    # All role keys that either _ONE_SHOT_MODEL_MAP or _PLANNING_MODEL_MAP can receive.
+    all_role_keys = (
+        "model", "researcher_model", "engineer_model", "planner_model",
+        "plan_reviewer_model", "idea_maker_model", "idea_hater_model",
+        "web_surfer_model", "formatter_model", "orchestration_model",
+    )
+    injected: list[str] = []
+    for key in all_role_keys:
+        if not out.get(key):
+            out[key] = default
+            injected.append(key)
+    if injected:
+        logger.info("auto_injected_default_model", model=default, roles=injected)
+    return out
 
 
 def _map_kwargs(values: Dict[str, Any], mapping: Dict[str, str]) -> Dict[str, Any]:
@@ -236,7 +302,7 @@ async def run_ai_stage(
     work_dir: str,
     agent: str = "researcher",
     config_overrides: Optional[Dict[str, Any]] = None,
-    max_rounds: int = 30,
+    max_rounds: int = 20,
     cost_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     plan_instructions: Optional[str] = None,
     researcher_instructions: Optional[str] = None,
@@ -283,6 +349,8 @@ async def run_ai_stage(
                     "Phase control failed" in err_str
                     or "Step " in err_str and "failed after" in err_str
                     or "Max attempts" in err_str
+                    or "timed out" in err_str.lower()
+                    or "timeout" in err_str.lower()
                 )
                 if not pc_signature:
                     raise
@@ -299,10 +367,14 @@ async def run_ai_stage(
                     researcher_instructions=researcher_instructions,
                     engineer_instructions=engineer_instructions,
                 )
+                # Cap fallback rounds lower than the primary budget — the
+                # researcher has already seen P&C try to solve this; it
+                # should converge faster in one_shot.
+                fallback_rounds = min(max_rounds, 15)
                 return await _run_one_shot(
                     prompt=fallback_prompt, work_dir=work_dir, agent=agent,
                     model_overrides=model_overrides, iteration_limits=iteration_limits,
-                    fallback_max_rounds=max_rounds, callbacks=callbacks,
+                    fallback_max_rounds=fallback_rounds, callbacks=callbacks,
                 )
     except Exception as exc:
         logger.error("ai_stage_failed", mode=mode.value, error=str(exc))
@@ -359,6 +431,8 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
     import asyncio
     import cmbagent
 
+    model_overrides = _inject_default_model(model_overrides)
+
     def _call():
         kwargs: Dict[str, Any] = {
             "task": prompt,
@@ -373,7 +447,14 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
             kwargs["callbacks"] = callbacks
         return cmbagent.one_shot(**kwargs)
 
-    result = await asyncio.to_thread(_call)
+    timeout_s = _stage_timeout_seconds()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"one_shot stage timed out after {timeout_s}s (agent={agent}). "
+            "Check provider credentials/model routing and reduce stage complexity."
+        ) from exc
     return _extract_text(result, agent=agent)
 
 
@@ -393,6 +474,8 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
     """
     import asyncio
     from cmbagent.workflows.planning_control import planning_and_control_context_carryover
+
+    model_overrides = _inject_default_model(model_overrides)
 
     def _call():
         kwargs: Dict[str, Any] = {
@@ -431,7 +514,13 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
                 "stage console log for the offending needed_agents list."
             ) from exc
 
-    result = await asyncio.to_thread(_call)
+    timeout_s = _stage_timeout_seconds()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"planning_and_control stage timed out after {timeout_s}s (agent={agent})."
+        ) from exc
     return _extract_text(result, agent=agent)
 
 

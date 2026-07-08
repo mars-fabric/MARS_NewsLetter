@@ -26,7 +26,19 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import warnings
 from pathlib import Path
+
+# ── Suppress noisy third-party warnings that pollute the UI console logs ──────
+# autogen re-registers tool functions when the same agent is instantiated
+# across stages, which triggers harmless "Function X is being overridden"
+# UserWarnings. These are expected and safe to silence.
+warnings.filterwarnings("ignore", category=UserWarning, module="autogen")
+warnings.filterwarnings("ignore", message=r"Function '.*' is being overridden\.")
+# pydantic v1/v2 compat shims inside autogen/litellm
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="autogen")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="litellm")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="openai")
 
 BACKEND_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BACKEND_DIR.parent

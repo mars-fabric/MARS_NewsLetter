@@ -112,15 +112,18 @@ class StageModeConfig(BaseModel):
     own mode/models/limits — every cmbagent knob is reachable from the UI.
     Defaults are tuned for production newsletter quality:
 
-    * Stages 2–5 default to ``planning_and_control`` (planner + executor with
-      cross-step memory) which is what NewsPulse / PaperPulse use.
+    * All stages default to ``one_shot`` (reliable, fast, zero planner
+      overhead). Planning-and-control is still available via the UI but is
+      slower and requires a well-tuned iteration budget.
+    * Stage 5 (review/quality) runs as a LangGraph post-processor regardless
+      of this setting.
     * Stage 2 has an explicit ``top_companies_count`` so we discover the top-N
       companies in the chosen industries first, then drill into per-company news.
     """
-    stage_2_mode: CmbAgentMode = Field(default=CmbAgentMode.PLANNING_AND_CONTROL)
-    stage_3_mode: CmbAgentMode = Field(default=CmbAgentMode.PLANNING_AND_CONTROL)
-    stage_4_mode: CmbAgentMode = Field(default=CmbAgentMode.PLANNING_AND_CONTROL)
-    stage_5_mode: CmbAgentMode = Field(default=CmbAgentMode.PLANNING_AND_CONTROL)
+    stage_2_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
+    stage_3_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
+    stage_4_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
+    stage_5_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
 
     # Stage-2 specific knobs
     stage_2_top_companies_count: int = Field(default=12, ge=0, le=30, description="Top-N companies to discover via web search before per-company news extraction. 0 disables the company discovery substep.")
@@ -148,7 +151,9 @@ class NewsletterCreateRequest(BaseModel):
     industries: List[IndustrySelection] = Field(..., description="One or more industries with their sub-domain picks")
 
     date_from: str = Field(..., description="ISO date (YYYY-MM-DD) — start of coverage window")
-    date_to: str = Field(..., description="ISO date (YYYY-MM-DD) — end of coverage window")
+    # date_to is always overridden to today server-side (see _coverage_window_is_sane).
+    # The frontend sends today's date; even if it doesn't, we coerce it here.
+    date_to: str = Field(default="", description="ISO date (YYYY-MM-DD) — end of coverage window (always today)")
 
     source_mode: SourceMode = Field(default=SourceMode.COMBINED)
     user_urls: List[str] = Field(default_factory=list, description="URLs supplied directly by the user")
@@ -190,13 +195,12 @@ class NewsletterCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _coverage_window_is_sane(self) -> "NewsletterCreateRequest":
-        d_from = date.fromisoformat(self.date_from)
-        d_to = date.fromisoformat(self.date_to)
         today = date.today()
-        if d_from > d_to:
-            raise ValueError("date_from must be on or before date_to")
-        if d_to > today:
-            raise ValueError(f"date_to ({self.date_to}) cannot be in the future (today is {today.isoformat()})")
+        # Always coerce date_to to today — the UI only exposes start date.
+        self.date_to = today.isoformat()
+        d_from = date.fromisoformat(self.date_from)
+        if d_from > today:
+            raise ValueError(f"date_from ({self.date_from}) cannot be in the future (today is {today.isoformat()})")
         return self
 
 

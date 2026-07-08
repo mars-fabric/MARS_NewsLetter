@@ -90,8 +90,22 @@ def merge_overrides(setup: Dict[str, Any], stage_num: int,
 
     Per-call values win. The result is a single flat dict that mode_dispatcher
     splits back into model_overrides vs iteration_limits internally.
+
+    If NEWSLETTER_DEFAULT_MODEL (or CMBAGENT_DEFAULT_MODEL) is set in the
+    environment, it is used as the model fallback when no per-stage model
+    has been configured. This lets operators pin a single model for the entire
+    pipeline without editing stage-level configs.
     """
+    import os
     flat: Dict[str, Any] = {}
+    # Apply global default model first (lowest priority)
+    default_model = (
+        os.getenv("NEWSLETTER_DEFAULT_MODEL")
+        or os.getenv("CMBAGENT_DEFAULT_MODEL")
+        or ""
+    )
+    if default_model:
+        flat["model"] = default_model
     flat.update(stage_model_overrides(setup, stage_num))
     flat.update(stage_iteration_limits(setup, stage_num))
     flat.update(per_call or {})
@@ -104,7 +118,7 @@ def _stage_mode(setup: Dict[str, Any], stage_num: int,
         return override
     raw = (setup.get("mode_config") or {}).get(f"stage_{stage_num}_mode")
     if not raw:
-        return CmbAgentMode.PLANNING_AND_CONTROL
+        return CmbAgentMode.ONE_SHOT
     return CmbAgentMode(raw)
 
 
@@ -146,6 +160,20 @@ _RESEARCHER_ONLY_PLAN_INSTRUCTIONS = (
     "described in the task."
 )
 
+# For Stage 2 sub-steps: the researcher must do LIVE WEB SEARCHES via tools,
+# not transform an embedded document. Using _RESEARCHER_ONLY_PLAN_INSTRUCTIONS
+# for Stage 2 causes the planner to tell the researcher to 'extract from the
+# source document' — producing empty results because there is no source doc.
+_WEB_RESEARCH_PLAN_INSTRUCTIONS = (
+    "This task is a WEB RESEARCH task. The plan MUST contain exactly ONE step, "
+    "and that step MUST call the `researcher` agent. Do NOT include `idea_maker`, "
+    "`idea_hater`, or `engineer` agents. The researcher MUST use the duckduckgo_search "
+    "TOOL to run live web searches — it must NOT reason from memory or treat any "
+    "embedded text as a source document to extract from. The researcher's job is to "
+    "call the duckduckgo_search tool with the planned queries, read the returned "
+    "snippets/URLs, and emit the structured markdown output described in the task."
+)
+
 
 def _pin_single_step_researcher(merged: Dict[str, Any]) -> Dict[str, Any]:
     """Force a single-step researcher-only plan for content-transformation stages.
@@ -157,8 +185,9 @@ def _pin_single_step_researcher(merged: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(merged or {})
     out.setdefault("max_plan_steps", 1)
     out.setdefault("n_plan_reviews", 0)
-    # Give the single researcher step plenty of rounds to finish.
-    out.setdefault("max_rounds_control", 20)
+    # Content-transformation stages (3/4/5) transform an embedded document, not
+    # a live web feed, so 12 control rounds is sufficient.
+    out.setdefault("max_rounds_control", 12)
     return out
 
 
@@ -181,7 +210,7 @@ async def run_stage_1(
     mc = setup_payload.get("mode_config", {}) or {}
     mode_lines: List[str] = []
     for n in (2, 3, 4, 5):
-        mode_lines.append(f"- Stage {n}: `{mc.get(f'stage_{n}_mode', 'planning_and_control')}`")
+        mode_lines.append(f"- Stage {n}: `{mc.get(f'stage_{n}_mode', 'one_shot')}`")
 
     md = (
         f"# Newsletter Setup\n\n"

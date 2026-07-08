@@ -20,6 +20,17 @@ import json
 import sys
 import time
 from datetime import date, timedelta
+from pathlib import Path
+
+# Load .env before any app imports so that Azure/OpenAI credentials are in
+# os.environ when cmbagent's ProviderRegistry is first imported.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    _env_file = Path(__file__).parent.parent / ".env"
+    if _env_file.is_file():
+        load_dotenv(_env_file, override=True)
+except Exception:
+    pass  # dotenv missing — rely on shell env
 
 from fastapi.testclient import TestClient
 
@@ -57,10 +68,12 @@ def main() -> int:
         "user_urls": [],
         "audience": "tech leads",
         "mode_config": {
+            "stage_2_mode": args.mode,
             "stage_3_mode": args.mode,
             "stage_4_mode": args.mode,
             "stage_5_mode": args.mode,
             "stage_2_enrich_with_llm": False,
+            "stage_2_models": {},
             "stage_3_models": {},
             "stage_4_models": {},
             "stage_5_models": {},

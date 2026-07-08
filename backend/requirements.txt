@@ -35,3 +35,6 @@ fpdf2>=2.7
 #   pip install -e /path/to/mars_cmbagent[enterprise_gateway]
 # Or pin a released version once published:
 mars-cmbagent>=2.2.0
+sqlalchemy
+langchain
+langchain_community

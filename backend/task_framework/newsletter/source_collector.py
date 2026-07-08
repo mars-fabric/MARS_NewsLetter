@@ -207,38 +207,29 @@ async def _discover_top_companies(
         date_from=date_from, date_to=date_to, user_urls=user_urls,
     )
 
-    # In planning_and_control we hand the planner / researcher their instructions
-    # explicitly; in one_shot we just send the merged prompt.
-    if mode == CmbAgentMode.PLANNING_AND_CONTROL:
-        # Pin single-step researcher-only plan — see the note in
-        # helpers._pin_single_step_researcher. Without this the planner tends
-        # to fan out to idea_maker / idea_hater and never produces a parseable
-        # numbered company list.
-        from .helpers import _pin_single_step_researcher, _RESEARCHER_ONLY_PLAN_INSTRUCTIONS
-        pinned = _pin_single_step_researcher(config_overrides)
-        researcher_md = await call_llm_with_antirefusal(
-            lambda p: run_ai_stage(
-                prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=pinned, cost_callback=cost_callback,
-                plan_instructions=_RESEARCHER_ONLY_PLAN_INSTRUCTIONS,
-                researcher_instructions=research,
-            ),
-            primary_prompt=(
-                f"Identify the top {top_n} companies in the chosen industries / sub-domains for the window "
-                f"{date_from} → {date_to}. Follow the researcher instructions exactly and emit "
-                f"the markdown described."
-            ),
-        )
-    else:
-        # one_shot: send planner + researcher as a single document.
-        merged = plan + "\n\n---\n\n" + research
-        researcher_md = await call_llm_with_antirefusal(
-            lambda p: run_ai_stage(
-                prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=config_overrides, cost_callback=cost_callback,
-            ),
-            primary_prompt=merged,
-        )
+    # Always use ONE_SHOT for web-research substeps regardless of the user's stage
+    # mode. Planning_and_control consistently times out or fails its control phase
+    # on DDGS-heavy tasks (12 companies × 8 backends = 96+ HTTP calls), then the
+    # mandatory fallback to one_shot consumes another 240s. Skipping straight to
+    # one_shot saves the wasted P&C overhead and gives the researcher its full
+    # time budget in a single pass.
+    merged = (
+        plan
+        + "\n\n---\n\n"
+        + research
+        + "\n\n## Important — one_shot discipline\n"
+        "- Plan your queries internally, then **execute** them and emit the final\n"
+        "  numbered company list in the exact format described above.\n"
+        "- Do NOT emit a list of planned search queries as the answer.\n"
+        "- Call the duckduckgo_search TOOL (do not write Python code).\n"
+    )
+    researcher_md = await call_llm_with_antirefusal(
+        lambda p: run_ai_stage(
+            prompt=p, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
+            config_overrides=config_overrides, cost_callback=cost_callback,
+        ),
+        primary_prompt=merged,
+    )
 
     companies = _parse_top_companies(researcher_md)
     logger.info("top_companies_parsed", requested=top_n, parsed=len(companies))
@@ -308,37 +299,23 @@ async def _extract_per_company_news(
         date_from=date_from, date_to=date_to,
     )
 
-    if mode == CmbAgentMode.PLANNING_AND_CONTROL:
-        # Pin single-step researcher-only plan. Without this the P&C planner
-        # sees "run queries, dedupe by URL, save results" and routes the step
-        # to the `engineer` agent, which writes a Python data-collection
-        # script instead of returning news markdown. That failure mode was
-        # observed on 2026-07-06 (Stage 2-B emitted a full ddgs-wrapper
-        # script under `## 2-B — Per-Company News & Innovations`).
-        from .helpers import _pin_single_step_researcher, _RESEARCHER_ONLY_PLAN_INSTRUCTIONS
-        pinned = _pin_single_step_researcher(config_overrides)
-        researcher_instructions = (
-            "Execute the per-company news extraction task. For each company, run a `site:<domain>` search "
-            "and a free-form news search via the DDGS / web-search TOOL (do NOT write Python code to call "
-            "the tool — invoke the tool directly). Deduplicate by URL. Emit one `## <Company>` section per "
-            "company in the exact markdown format specified in the task prompt."
-        )
-        return await call_llm_with_antirefusal(
-            lambda p: run_ai_stage(
-                prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=pinned, cost_callback=cost_callback,
-                plan_instructions=_RESEARCHER_ONLY_PLAN_INSTRUCTIONS,
-                researcher_instructions=researcher_instructions,
-            ),
-            primary_prompt=prompt,
-        )
-
+    # Always use ONE_SHOT for 2-B. P&C adds overhead (planning phase, control
+    # loop) and consistently times out or routes to the engineer agent for
+    # Python script generation instead of direct DDGS tool calls.
+    one_shot_prompt = (
+        prompt
+        + "\n\n## Important — one_shot discipline\n"
+        "- For each company, call the `duckduckgo_search` TOOL directly — do NOT write Python code.\n"
+        "- Plan your queries internally, then execute them and emit the `## <Company>` sections.\n"
+        "- Do NOT emit a list of planned search queries as the final answer.\n"
+        "- Always include at least the most recent item per company from the snippet content.\n"
+    )
     return await call_llm_with_antirefusal(
         lambda p: run_ai_stage(
-            prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
+            prompt=p, mode=CmbAgentMode.ONE_SHOT, work_dir=work_dir, agent="researcher",
             config_overrides=config_overrides, cost_callback=cost_callback,
         ),
-        primary_prompt=prompt,
+        primary_prompt=one_shot_prompt,
     )
 
 
@@ -381,48 +358,25 @@ async def _industry_wide_discovery(
         min_sources=min_sources, seed_companies=seed_companies,
     )
 
-    if mode == CmbAgentMode.PLANNING_AND_CONTROL:
-        # Pin single-step researcher-only, same as Stage 3 curation. This
-        # prevents the planner from fanning out to `idea_maker` /
-        # `idea_hater` / `engineer` and turning source collection into a
-        # multi-step ideation loop.
-        from .helpers import _pin_single_step_researcher, _RESEARCHER_ONLY_PLAN_INSTRUCTIONS
-        pinned = _pin_single_step_researcher(config_overrides)
-        result = await call_llm_with_antirefusal(
-            lambda p: run_ai_stage(
-                prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=pinned, cost_callback=cost_callback,
-                # IMPORTANT: pass researcher-only guidance to the planner,
-                # NOT the discovery_planner_prompt (that would leak query
-                # lists into the final output — see docstring).
-                plan_instructions=_RESEARCHER_ONLY_PLAN_INSTRUCTIONS,
-                researcher_instructions=research,
-            ),
-            primary_prompt=(
-                f"Collect at least {min_sources} unique sources for the newsletter on "
-                f"{', '.join(industries)} ({date_from} → {date_to}). Follow the researcher "
-                f"instructions exactly and emit the markdown of `### <title>` blocks described. "
-                f"Do NOT emit a list of search queries — you must run the queries via the DDGS / "
-                f"web-search tool and return the extracted items."
-            ),
-        )
-        # Safety net: if the researcher STILL echoes the query plan instead
-        # of executing it, fall back to one_shot. This is an emergency path,
-        # not a routine one — with the researcher-only pin above it should
-        # rarely fire. Kept because the alternative (empty Stage 2-C) breaks
-        # the whole newsletter.
-        if looks_like_query_plan_only(result):
-            logger.warning("stage_2c_returned_query_plan_falling_back_to_one_shot")
-            return await _industry_wide_one_shot(
-                research=research, min_sources=min_sources, work_dir=work_dir,
-                config_overrides=config_overrides, cost_callback=cost_callback,
-            )
-        return result
-
-    return await _industry_wide_one_shot(
+    # Always use ONE_SHOT for 2-C. P&C for web research consistently:
+    #   (a) times out in the control phase, or
+    #   (b) echoes the planner's query list instead of executing queries.
+    # The one_shot path handles both failure modes via the discipline note and
+    # the looks_like_query_plan_only safety net, within the extended timeout.
+    result = await _industry_wide_one_shot(
         research=research, min_sources=min_sources, work_dir=work_dir,
         config_overrides=config_overrides, cost_callback=cost_callback,
     )
+    if looks_like_query_plan_only(result):
+        logger.warning("stage_2c_returned_query_plan_retrying_with_stricter_prompt")
+        result = await _industry_wide_one_shot(
+            research=research + "\n\nCRITICAL: you returned a query plan last time. "
+            "This retry MUST return only executed results in the `### <title>` block format. "
+            "Execute every planned query via the DDGS tool NOW and emit the items.",
+            min_sources=min_sources, work_dir=work_dir,
+            config_overrides=config_overrides, cost_callback=cost_callback,
+        )
+    return result
 
 
 async def _industry_wide_one_shot(

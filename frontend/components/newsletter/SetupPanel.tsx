@@ -24,15 +24,10 @@ interface Props {
 }
 
 const DEFAULT_MODE_CONFIG: StageModeConfig = {
-  // planning_and_control is the PaperPulse-style planner→researcher→engineer
-  // pipeline; one_shot is a single researcher agent. Defaults: P&C for the
-  // discovery-heavy stages (2 source-collection, 3 curation), one_shot for
-  // the generation/review stages where Stage 4's own section orchestrator
-  // and Stage 5's LangGraph handle planning themselves.
   stage_2_mode: 'planning_and_control',
   stage_3_mode: 'planning_and_control',
-  stage_4_mode: 'one_shot',
-  stage_5_mode: 'one_shot',
+  stage_4_mode: 'planning_and_control',
+  stage_5_mode: 'planning_and_control',
   // Stage-2 collection knobs
   stage_2_top_companies_count: 12,
   stage_2_min_sources: 30,
@@ -61,7 +56,8 @@ export function SetupPanel({ onCreate, busy }: Props) {
   const [title, setTitle] = useState('');
   const [audience, setAudience] = useState('');
   const [dateFrom, setDateFrom] = useState(daysAgo(7));
-  const [dateTo, setDateTo] = useState(today);
+  // End date is always today — not exposed in the UI so users always get the latest data.
+  const dateTo = today;
   const [industries, setIndustries] = useState<IndustrySelection[]>([]);
   const [sourceMode, setSourceMode] = useState<SourceMode>('combined');
   const [userUrls, setUserUrls] = useState<string[]>([]);
@@ -90,11 +86,11 @@ export function SetupPanel({ onCreate, busy }: Props) {
 
   /** Per-section completion — drives the green tick on each rail item. */
   const completion: Record<string, boolean> = useMemo(() => ({
-    'sec-scope': dateFrom <= dateTo && dateTo <= today,
+    'sec-scope': !!dateFrom && dateFrom <= today,
     'sec-industries': industries.length > 0 && industries.every((i) => i.sub_domains.length > 0),
     'sec-sources': sourceMode === 'ddgs_only' || userUrls.length > 0,
     'sec-strategy': true,
-  }), [dateFrom, dateTo, today, industries, sourceMode, userUrls]);
+  }), [dateFrom, today, industries, sourceMode, userUrls]);
 
   const scrollTo = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -126,12 +122,12 @@ export function SetupPanel({ onCreate, busy }: Props) {
     industries.forEach((i) => {
       if (!i.sub_domains.length) errs.push(`Pick at least one sub-domain for ${i.industry}.`);
     });
-    if (dateFrom > dateTo) errs.push('Start date must be on or before end date.');
-    if (dateTo > today) errs.push('Coverage end cannot be in the future.');
+    if (!dateFrom) errs.push('Pick a coverage start date.');
+    if (dateFrom > today) errs.push('Start date cannot be in the future.');
     if (sourceMode !== 'ddgs_only' && userUrls.length === 0)
       errs.push('Provide at least one URL or switch to "Web search only".');
     return errs;
-  }, [industries, dateFrom, dateTo, today, sourceMode, userUrls]);
+  }, [industries, dateFrom, today, sourceMode, userUrls]);
 
   const canSubmit = validation.length === 0 && !busy;
 
@@ -338,13 +334,12 @@ export function SetupPanel({ onCreate, busy }: Props) {
               onChange={(e) => setDateFrom(e.target.value)}
             />
           </Field>
-          <Field icon={<CalendarDays size={14} />} label="Coverage end">
+          <Field icon={<CalendarDays size={14} />} label="Coverage end (always today)" optional>
             <input
               type="date"
-              value={dateTo}
-              max={today}
-              min={dateFrom}
-              onChange={(e) => setDateTo(e.target.value)}
+              value={today}
+              disabled
+              style={{ opacity: 0.5, cursor: 'not-allowed' }}
             />
           </Field>
         </div>
