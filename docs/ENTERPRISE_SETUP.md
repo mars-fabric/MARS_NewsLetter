@@ -433,53 +433,49 @@ Work with your platform team to obtain:
 - Whether a **session JWT exchange** (Stage 2) is required, and if so its
   endpoint and body template
 
-### Step 2 — Configure `.env` (Password Grant Flow)
+### Step 2 — Configure `.env` (Password Grant Flow — minimal)
+
+Only the following variables are required for a typical two-stage
+enterprise gateway. Everything else has a sensible default. A fresh
+W3C `traceparent` header is auto-injected on every session-JWT and
+gateway call — **do not configure it manually**.
 
 ```bash
 # backend/.env — Enterprise Gateway, grant_type=password
 
 CMBAGENT_LLM_PROVIDER=enterprise_gateway
 
-# Stage 1: access token
+# Stage 1: OAuth2 token endpoint
 ENTERPRISE_LLM_TOKEN_URL=https://idp.mycompany.com/oauth2/token
 ENTERPRISE_LLM_GRANT_TYPE=password
 ENTERPRISE_LLM_USERNAME=svc-newsletter
 ENTERPRISE_LLM_PASSWORD=P@ssw0rdF0rSvcAccount!
 ENTERPRISE_LLM_CLIENT_ID=mars-newsletter-client
-ENTERPRISE_LLM_SCOPE=llm.access
-ENTERPRISE_LLM_TOKEN_ENCODING=form
-ENTERPRISE_LLM_TOKEN_FIELD=access_token
-ENTERPRISE_LLM_TOKEN_TTL_SECONDS=3300
 
-# Stage 2: session JWT exchange (optional — leave blank to skip)
+# Stage 2: session JWT exchange (skip entirely by leaving SESSION_URL blank)
 ENTERPRISE_LLM_SESSION_URL=https://gateway-portal.mycompany.com/api/auth/session-jwt
-ENTERPRISE_LLM_SESSION_METHOD=POST
-ENTERPRISE_LLM_SESSION_BODY={"username":"{username}"}
-ENTERPRISE_LLM_SESSION_TOKEN_FIELD=token
-ENTERPRISE_LLM_SESSION_TTL_SECONDS=900
-ENTERPRISE_LLM_SESSION_EXTRA_HEADERS_JSON={"traceparent":"${traceparent}"}
+# Set only if the endpoint expects a body (supports {access_token}, {username}):
+# ENTERPRISE_LLM_SESSION_BODY={"username":"{username}"}
 
-# Gateway call configuration
+# Gateway call
 ENTERPRISE_LLM_GATEWAY_BASE_URL=https://llm-gateway.mycompany.com/v1/
-ENTERPRISE_LLM_ACCESS_HEADER=Authorization
-ENTERPRISE_LLM_SESSION_HEADER=X-Authorization-Session
-ENTERPRISE_LLM_CONSUMER_HEADER=X-Consumer-Application
 ENTERPRISE_LLM_CONSUMER_APPLICATION=mars-newsletter
 ENTERPRISE_LLM_DEFAULT_MODEL=gpt-4o
 
-# Optional: model name mapping (canonical → gateway-native)
-ENTERPRISE_LLM_MODEL_MAP_JSON={"gpt-4o":"gpt-4-omni","gpt-4.1":"gpt-4.1"}
-
-# TLS / networking
+# TLS (only if the defaults don't match your setup)
 ENTERPRISE_LLM_CA_BUNDLE=/etc/ssl/certs/mycompany-ca-bundle.pem
-ENTERPRISE_LLM_VERIFY_SSL=true
-ENTERPRISE_LLM_PROXIES_JSON={"https":"http://proxy.mycompany.com:8080"}
-ENTERPRISE_LLM_AUTH_TIMEOUT_SECONDS=30
-ENTERPRISE_LLM_CHAT_TIMEOUT_SECONDS=120
-ENTERPRISE_LLM_MAX_AUTH_RETRIES=2
 ```
 
-### Step 3 — Configure `.env` (Client Credentials Flow)
+Optional additions (only when the defaults don't fit):
+
+```bash
+# Model name mapping (canonical → gateway-native), scope, proxies
+ENTERPRISE_LLM_MODEL_MAP_JSON={"gpt-4o":"gpt-4-omni","gpt-4.1":"gpt-4.1"}
+ENTERPRISE_LLM_SCOPE=llm.access
+ENTERPRISE_LLM_PROXIES_JSON={"https":"http://proxy.mycompany.com:8080"}
+```
+
+### Step 3 — Configure `.env` (Client Credentials Flow — minimal)
 
 ```bash
 # backend/.env — Enterprise Gateway, grant_type=client_credentials
@@ -491,23 +487,18 @@ ENTERPRISE_LLM_GRANT_TYPE=client_credentials
 ENTERPRISE_LLM_CLIENT_ID=mars-newsletter-client
 ENTERPRISE_LLM_PASSWORD=AbCdEfGhIjKlMnOpQrStUvWxYz-client-secret
 ENTERPRISE_LLM_SCOPE=api://llm-gateway/.default
-ENTERPRISE_LLM_TOKEN_ENCODING=form
-ENTERPRISE_LLM_TOKEN_FIELD=access_token
-ENTERPRISE_LLM_TOKEN_TTL_SECONDS=3540
 
-# No Stage 2 session exchange needed for this gateway:
-ENTERPRISE_LLM_SESSION_URL=
+# No Stage 2 session exchange needed for this gateway — omit SESSION_URL.
 
 ENTERPRISE_LLM_GATEWAY_BASE_URL=https://llm-gateway.mycompany.com/v1/
-ENTERPRISE_LLM_ACCESS_HEADER=Authorization
-ENTERPRISE_LLM_CONSUMER_HEADER=X-Consumer-Application
 ENTERPRISE_LLM_CONSUMER_APPLICATION=mars-newsletter
 ENTERPRISE_LLM_DEFAULT_MODEL=gpt-4o
 ENTERPRISE_LLM_CA_BUNDLE=/etc/ssl/certs/mycompany-ca-bundle.pem
-ENTERPRISE_LLM_VERIFY_SSL=true
 ```
 
 ### Variable Reference for Enterprise Gateway
+
+**Required (or nearly always set):**
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -517,30 +508,45 @@ ENTERPRISE_LLM_VERIFY_SSL=true
 | `ENTERPRISE_LLM_PASSWORD` | Yes | Password (for `password` grant) or client secret |
 | `ENTERPRISE_LLM_CLIENT_ID` | Yes | OAuth2 client ID |
 | `ENTERPRISE_LLM_RESOURCE` | No | ADFS-style resource claim |
-| `ENTERPRISE_LLM_SCOPE` | No | OAuth2 scope (space-separated) |
-| `ENTERPRISE_LLM_TOKEN_ENCODING` | No | `form` (default) or `json` |
-| `ENTERPRISE_LLM_TOKEN_FIELD` | No | Response field containing the token (default: `access_token`) |
-| `ENTERPRISE_LLM_TOKEN_TTL_SECONDS` | No | Fallback TTL if `expires_in` is absent (default: 3300) |
-| `ENTERPRISE_LLM_SESSION_URL` | No | Stage 2 session JWT endpoint — leave blank to skip |
-| `ENTERPRISE_LLM_SESSION_METHOD` | No | HTTP method for session exchange (default: `POST`) |
-| `ENTERPRISE_LLM_SESSION_BODY` | No | JSON body template; supports `{access_token}`, `{username}` |
-| `ENTERPRISE_LLM_SESSION_TOKEN_FIELD` | No | Response field for session token (default: `token`) |
-| `ENTERPRISE_LLM_SESSION_TTL_SECONDS` | No | Session token TTL in seconds (default: 900) |
-| `ENTERPRISE_LLM_SESSION_EXTRA_HEADERS_JSON` | No | JSON map of extra headers for the session exchange; supports `${traceparent}` and `${env:VARNAME}` |
+| `ENTERPRISE_LLM_SESSION_URL` | No | Stage 2 session JWT endpoint — leave blank to skip Stage 2 |
+| `ENTERPRISE_LLM_SESSION_BODY` | No | JSON body template for Stage 2 — supports `{access_token}`, `{username}` |
 | `ENTERPRISE_LLM_GATEWAY_BASE_URL` | Yes | OpenAI-wire-compatible gateway base URL |
-| `ENTERPRISE_LLM_ACCESS_HEADER` | No | Header name for the access token (default: `Authorization`) |
-| `ENTERPRISE_LLM_SESSION_HEADER` | No | Header name for the session token (ignored if Stage 2 skipped) |
-| `ENTERPRISE_LLM_CONSUMER_HEADER` | No | Header name for the consumer application identifier |
-| `ENTERPRISE_LLM_CONSUMER_APPLICATION` | No | Consumer application ID value |
-| `ENTERPRISE_LLM_EXTRA_HEADERS_JSON` | No | Additional per-call headers for all gateway requests |
-| `ENTERPRISE_LLM_MODEL_MAP_JSON` | No | JSON map from canonical model names to gateway-native names |
+| `ENTERPRISE_LLM_CONSUMER_APPLICATION` | No | Consumer application ID value (many gateways require it) |
 | `ENTERPRISE_LLM_DEFAULT_MODEL` | Yes | Model name to use (after mapping) |
+| `ENTERPRISE_LLM_MODEL_MAP_JSON` | No | JSON map from canonical model names to gateway-native names |
 | `ENTERPRISE_LLM_CA_BUNDLE` | No | Path to corporate CA certificate bundle |
 | `ENTERPRISE_LLM_VERIFY_SSL` | No | `true` (default) or `false` (development only) |
 | `ENTERPRISE_LLM_PROXIES_JSON` | No | JSON proxy map e.g. `{"https":"http://proxy:8080"}` |
-| `ENTERPRISE_LLM_AUTH_TIMEOUT_SECONDS` | No | Timeout for token endpoint calls (default: 30) |
-| `ENTERPRISE_LLM_CHAT_TIMEOUT_SECONDS` | No | Timeout for chat completions calls (default: 120) |
-| `ENTERPRISE_LLM_MAX_AUTH_RETRIES` | No | Auth retries on 401 before hard failure (default: 2) |
+| `ENTERPRISE_LLM_SCOPE` | No | OAuth2 scope (space-separated) |
+
+**Automatic — do NOT configure:**
+
+- Fresh W3C `traceparent` header is injected on every session-JWT and gateway
+  call. If your gateway does not need it, override with an empty string via
+  `ENTERPRISE_LLM_SESSION_EXTRA_HEADERS_JSON={"traceparent":""}` (rare).
+- Token cache TTL is derived from the `expires_in` field returned by the
+  identity provider, minus a 60-second safety margin.
+- 401 responses from the gateway automatically invalidate both cached
+  tokens and retry once.
+
+**Advanced overrides (rarely needed — the shown value is the default):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENTERPRISE_LLM_TOKEN_ENCODING` | `form` | Stage-1 body encoding (`form` or `json`) |
+| `ENTERPRISE_LLM_TOKEN_FIELD` | `access_token` | Stage-1 response field containing the access token |
+| `ENTERPRISE_LLM_TOKEN_TTL_SECONDS` | `3300` | Fallback TTL used only when `expires_in` is absent |
+| `ENTERPRISE_LLM_SESSION_METHOD` | `POST` | HTTP method for Stage 2 |
+| `ENTERPRISE_LLM_SESSION_TOKEN_FIELD` | `token` | Response field for the session token |
+| `ENTERPRISE_LLM_SESSION_TTL_SECONDS` | `900` | Fallback TTL used only when `expires_in` is absent |
+| `ENTERPRISE_LLM_SESSION_EXTRA_HEADERS_JSON` | — | Additional headers for the Stage 2 call. Supports `${traceparent}` (already auto-added) and `${env:VARNAME}` |
+| `ENTERPRISE_LLM_ACCESS_HEADER` | `Authorization` | Header name for the access token (sent as `Bearer …`) |
+| `ENTERPRISE_LLM_SESSION_HEADER` | `X-Authorization-Session` | Header name for the session token |
+| `ENTERPRISE_LLM_CONSUMER_HEADER` | `X-Consumer-Application` | Header name for the consumer identifier |
+| `ENTERPRISE_LLM_EXTRA_HEADERS_JSON` | — | Additional per-call gateway headers |
+| `ENTERPRISE_LLM_AUTH_TIMEOUT_SECONDS` | `30` | Timeout for token-endpoint calls |
+| `ENTERPRISE_LLM_CHAT_TIMEOUT_SECONDS` | `120` | Timeout for `/chat/completions` calls |
+| `ENTERPRISE_LLM_MAX_AUTH_RETRIES` | `2` | Retries on transient failures before hard failure |
 
 ### TLS and Proxy Notes
 
@@ -915,6 +921,13 @@ function. Variables marked **Optional** have defaults and can be omitted.
 | `MISTRAL_API_KEY` | Conditional | — | Mistral API key |
 
 ### 8.10 Enterprise Gateway
+
+> Most deployments only need the variables marked **Yes (gateway)** plus
+> `ENTERPRISE_LLM_SESSION_URL`, `ENTERPRISE_LLM_CONSUMER_APPLICATION`,
+> and `ENTERPRISE_LLM_CA_BUNDLE`. Everything else has a sensible default.
+> A fresh W3C `traceparent` header is auto-injected on every request —
+> do NOT configure `ENTERPRISE_LLM_SESSION_EXTRA_HEADERS_JSON` or
+> `ENTERPRISE_LLM_EXTRA_HEADERS_JSON` for that purpose.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
