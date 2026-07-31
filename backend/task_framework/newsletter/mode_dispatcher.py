@@ -49,6 +49,20 @@ def _stage_timeout_seconds() -> int:
     return max(60, val)
 
 
+def _deep_research_timeout_seconds() -> int:
+    """Hard cap for a single ``deep_research`` call (default 900s / 15 min).
+
+    Deep research runs multiple planning + execution rounds with context
+    carryover, so it needs a much larger budget than a one_shot stage.
+    """
+    raw = os.getenv("NEWSLETTER_DEEP_RESEARCH_TIMEOUT_S", "900").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        return 900
+    return max(240, val)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # cmbagent hardening: the upstream `plan_setter` tool signature declares
 # `needed_agents: List[Literal["engineer","researcher","idea_maker",
@@ -173,6 +187,15 @@ _ONE_SHOT_LIMIT_MAP = {
     "max_n_attempts": "max_n_attempts",
 }
 _PLANNING_LIMIT_MAP = {
+    "n_plan_reviews": "n_plan_reviews",
+    "max_plan_steps": "max_plan_steps",
+    "max_n_attempts": "max_n_attempts",
+    "max_rounds_planning": "max_rounds_planning",
+    "max_rounds_control": "max_rounds_control",
+}
+
+# ``deep_research`` shares the planning role map and adds two of its own knobs.
+_DEEP_RESEARCH_LIMIT_MAP = {
     "n_plan_reviews": "n_plan_reviews",
     "max_plan_steps": "max_plan_steps",
     "max_n_attempts": "max_n_attempts",
@@ -307,8 +330,13 @@ async def run_ai_stage(
     plan_instructions: Optional[str] = None,
     researcher_instructions: Optional[str] = None,
     engineer_instructions: Optional[str] = None,
+    allow_web_tools: bool = True,
 ) -> str:
     """Run an LLM stage via mars_cmbagent in the requested mode and return the final text.
+
+    ``allow_web_tools=False`` disables DDGS / LangChain / CrewAI free tools for
+    content-transformation stages (e.g. Stage-4 analyst) that should work from
+    the curated material only and not run additional web searches.
 
     Falls back to a stub when cmbagent is unavailable.
     """
@@ -327,7 +355,40 @@ async def run_ai_stage(
                 prompt=prompt, work_dir=work_dir, agent=agent,
                 model_overrides=model_overrides, iteration_limits=iteration_limits,
                 fallback_max_rounds=max_rounds, callbacks=callbacks,
+                allow_web_tools=allow_web_tools,
             )
+        if mode == CmbAgentMode.DEEP_RESEARCH:
+            try:
+                return await _run_deep_research(
+                    prompt=prompt, work_dir=work_dir,
+                    model_overrides=model_overrides, iteration_limits=iteration_limits,
+                    callbacks=callbacks,
+                    plan_instructions=plan_instructions or "",
+                    researcher_instructions=researcher_instructions or "",
+                    engineer_instructions=engineer_instructions or "",
+                    allow_web_tools=allow_web_tools,
+                )
+            except Exception as dr_exc:
+                # Deep research is the heaviest mode and the most failure-prone
+                # (multi-step planner/executor). On any failure, degrade to a
+                # single-pass one_shot so the section still gets drafted rather
+                # than aborting the whole newsletter.
+                logger.warning(
+                    "deep_research_failed_falling_back_to_one_shot",
+                    error=str(dr_exc)[:200],
+                )
+                fallback_prompt = _merge_instructions_for_one_shot(
+                    prompt=prompt,
+                    plan_instructions=plan_instructions,
+                    researcher_instructions=researcher_instructions,
+                    engineer_instructions=engineer_instructions,
+                )
+                return await _run_one_shot(
+                    prompt=fallback_prompt, work_dir=work_dir, agent=agent,
+                    model_overrides=model_overrides, iteration_limits=iteration_limits,
+                    fallback_max_rounds=max_rounds, callbacks=callbacks,
+                    allow_web_tools=allow_web_tools,
+                )
         if mode == CmbAgentMode.PLANNING_AND_CONTROL:
             try:
                 return await _run_planning_control(
@@ -337,6 +398,7 @@ async def run_ai_stage(
                     plan_instructions=plan_instructions or "",
                     researcher_instructions=researcher_instructions or "",
                     engineer_instructions=engineer_instructions or "",
+                    allow_web_tools=allow_web_tools,
                 )
             except Exception as pc_exc:
                 # cmbagent's control phase raises "Step N failed after K
@@ -375,6 +437,7 @@ async def run_ai_stage(
                     prompt=fallback_prompt, work_dir=work_dir, agent=agent,
                     model_overrides=model_overrides, iteration_limits=iteration_limits,
                     fallback_max_rounds=fallback_rounds, callbacks=callbacks,
+                    allow_web_tools=allow_web_tools,
                 )
     except Exception as exc:
         logger.error("ai_stage_failed", mode=mode.value, error=str(exc))
@@ -420,13 +483,15 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
                         model_overrides: Dict[str, Any],
                         iteration_limits: Dict[str, Any],
                         fallback_max_rounds: int,
-                        callbacks: Any = None) -> str:
+                        callbacks: Any = None,
+                        allow_web_tools: bool = True) -> str:
     """Invoke ``cmbagent.one_shot`` via to_thread (cmbagent is sync).
 
-    ``enable_ag2_free_tools=True`` is set unconditionally so DDGS, Wikipedia,
-    ArXiv and the other free LangChain/CrewAI web-search tools are wired
-    into the researcher agent. Without it, the researcher cannot actually
-    reach the web and Stage 2/3/4 collapse into hallucinated content.
+    ``enable_ag2_free_tools`` controls whether DDGS, Wikipedia, ArXiv and the
+    other free LangChain/CrewAI web-search tools are wired into the researcher
+    agent. Set ``allow_web_tools=False`` for content-transformation stages
+    (e.g. Stage-4 analyst) so the researcher works from the curated material
+    only and never runs additional DDGS searches.
     """
     import asyncio
     import cmbagent
@@ -439,7 +504,7 @@ async def _run_one_shot(*, prompt: str, work_dir: str, agent: str,
             "agent": agent,
             "work_dir": work_dir,
             "max_rounds": fallback_max_rounds,
-            "enable_ag2_free_tools": True,
+            "enable_ag2_free_tools": allow_web_tools,
             **_map_kwargs(model_overrides, _ONE_SHOT_MODEL_MAP),
             **_map_kwargs(iteration_limits, _ONE_SHOT_LIMIT_MAP),
         }
@@ -464,7 +529,8 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
                                 callbacks: Any = None,
                                 plan_instructions: str = "",
                                 researcher_instructions: str = "",
-                                engineer_instructions: str = "") -> str:
+                                engineer_instructions: str = "",
+                                allow_web_tools: bool = True) -> str:
     """Always uses ``planning_and_control_context_carryover`` (same as PaperPulse).
 
     Per-stage instructions (``plan_instructions``, ``researcher_instructions``,
@@ -481,10 +547,10 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
         kwargs: Dict[str, Any] = {
             "task": prompt,
             "work_dir": work_dir,
-            # DDGS + LangChain + CrewAI free tools — same rationale as the
-            # one_shot path. In planning_and_control the researcher agent is
-            # the primary consumer of web search.
-            "enable_ag2_free_tools": True,
+            # DDGS + LangChain + CrewAI free tools — caller controls whether
+            # web search tools are enabled (allow_web_tools=False for
+            # content-transformation stages like the Stage-4 analyst).
+            "enable_ag2_free_tools": allow_web_tools,
             **_map_kwargs(model_overrides, _PLANNING_MODEL_MAP),
             **_map_kwargs(iteration_limits, _PLANNING_LIMIT_MAP),
         }
@@ -522,6 +588,110 @@ async def _run_planning_control(*, prompt: str, work_dir: str, agent: str,
             f"planning_and_control stage timed out after {timeout_s}s (agent={agent})."
         ) from exc
     return _extract_text(result, agent=agent)
+
+
+async def _run_deep_research(*, prompt: str, work_dir: str,
+                             model_overrides: Dict[str, Any],
+                             iteration_limits: Dict[str, Any],
+                             callbacks: Any = None,
+                             plan_instructions: str = "",
+                             researcher_instructions: str = "",
+                             engineer_instructions: str = "",
+                             allow_web_tools: bool = True) -> str:
+    """Invoke cmbagent's ``deep_research`` workflow (multi-step planner → reviewer
+    → iterative executor with full context carryover).
+
+    Deep research writes researcher notes to markdown files under a dedicated
+    sub-directory and accumulates a running synthesis in
+    ``final_context['previous_steps_execution_summary']`` /
+    ``_step_summaries_accumulator``. We prefer the accumulated synthesis (a
+    cross-step research brief — exactly what the Stage-4 writer wants), then
+    fall back to the largest markdown artefact, then to ``_extract_text``.
+    """
+    import asyncio
+    import os as _os
+    from cmbagent.workflows.deep_research import deep_research
+
+    model_overrides = _inject_default_model(model_overrides)
+
+    # Isolate each deep-research run in its own sub-dir so artefacts from one
+    # section never bleed into another.
+    import uuid as _uuid
+    dr_dir = _os.path.join(work_dir, "deep_research", _uuid.uuid4().hex[:8])
+    _os.makedirs(dr_dir, exist_ok=True)
+
+    def _call():
+        kwargs: Dict[str, Any] = {
+            "task": prompt,
+            "work_dir": dr_dir,
+            "enable_ag2_free_tools": allow_web_tools,
+            **_map_kwargs(model_overrides, _PLANNING_MODEL_MAP),
+            **_map_kwargs(iteration_limits, _DEEP_RESEARCH_LIMIT_MAP),
+        }
+        if plan_instructions:
+            kwargs["plan_instructions"] = plan_instructions
+        if researcher_instructions:
+            kwargs["researcher_instructions"] = researcher_instructions
+        if engineer_instructions:
+            kwargs["engineer_instructions"] = engineer_instructions
+        if callbacks is not None:
+            kwargs["callbacks"] = callbacks
+        try:
+            return deep_research(**kwargs)
+        except SystemExit as exc:  # same sys.exit() hazard as planning_control
+            raise RuntimeError(
+                f"cmbagent deep_research aborted via sys.exit(): {exc!r}."
+            ) from exc
+
+    timeout_s = _deep_research_timeout_seconds()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"deep_research timed out after {timeout_s}s."
+        ) from exc
+
+    # 1. Prefer the cross-step synthesis accumulated in final_context.
+    if isinstance(result, dict):
+        fc = result.get("final_context")
+        if isinstance(fc, dict):
+            for key in ("previous_steps_execution_summary", "_step_summaries_accumulator"):
+                val = fc.get(key)
+                if isinstance(val, str) and len(val.strip()) > 200:
+                    return val.strip()
+
+    # 2. Fall back to the largest markdown artefact produced on disk.
+    md_text = _read_largest_markdown(dr_dir)
+    if md_text and len(md_text.strip()) > 200:
+        return md_text.strip()
+
+    # 3. Last resort: generic extraction.
+    return _extract_text(result, agent="researcher")
+
+
+def _read_largest_markdown(root_dir: str) -> str:
+    """Return the content of the largest ``.md`` file under ``root_dir`` (or "")."""
+    import os as _os
+    best_path = None
+    best_size = 0
+    for dirpath, _dirs, files in _os.walk(root_dir):
+        for name in files:
+            if not name.lower().endswith((".md", ".markdown")):
+                continue
+            path = _os.path.join(dirpath, name)
+            try:
+                size = _os.path.getsize(path)
+            except OSError:
+                continue
+            if size > best_size:
+                best_size, best_path = size, path
+    if not best_path:
+        return ""
+    try:
+        with open(best_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 _MD_CODE_BLOCK_RE = r"```(?:markdown)?\s*\n([\s\S]*?)```"

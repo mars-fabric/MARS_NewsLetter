@@ -228,6 +228,7 @@ def build_section_prompt(
     user_urls: Optional[Iterable[str]],
     prior_sections_tail: str,
     today: str,
+    total_sections: int = 22,
 ) -> str:
     """Build the user prompt for a single section.
 
@@ -245,9 +246,9 @@ def build_section_prompt(
     user_url_lines = "\n".join(f"  - {u}" for u in (user_urls or [])) or "  (none)"
 
     return (
-        f"# Newsletter section writer — section {spec.number} of 22\n\n"
+        f"# Newsletter section writer — section {spec.number} of {total_sections}\n\n"
         f"Today is **{today}**. You are drafting **one section** of a long-form "
-        f"professional newsletter. The other 21 sections are being written "
+        f"professional newsletter. The other {total_sections - 1} sections are being written "
         f"separately — do not produce them.\n\n"
         f"- Newsletter title: {title}\n"
         f"- Coverage window: {setup.get('date_from')} → {setup.get('date_to')}\n"
@@ -270,6 +271,14 @@ def build_section_prompt(
         "this is the ONLY acceptable form of stub.\n"
         "- Tone: professional, neutral, authoritative, implication-led. No "
         "superlatives the source does not support. No 'as an AI'. No apologies.\n"
+        "- **Executive-grade writing (this report is read by CEOs / CTOs).** "
+        "Lead with the conclusion or business implication, then the evidence. "
+        "Prefer specific numbers, named entities, and dollar/benchmark figures "
+        "over vague adjectives. Cut filler, hedging, and throat-clearing "
+        "('it is worth noting', 'in today's fast-paced world'). Every sentence "
+        "must earn its place; a busy executive should grasp the point in one "
+        "read. Where relevant, state the 'so what' for strategy, cost, risk, or "
+        "competitive positioning.\n"
         "- Do not repeat content from prior sections (see tail below). Add new "
         "framing, new angles, new bullets — not paraphrases.\n\n"
         "## Analyst outline (for thematic continuity)\n"

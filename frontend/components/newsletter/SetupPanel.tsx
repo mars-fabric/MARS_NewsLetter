@@ -1,6 +1,6 @@
 'use client';
 
-import { AlertTriangle, CalendarDays, Check, FileText, Layers, Rocket, Settings2, Users } from 'lucide-react';
+import { AlertTriangle, CalendarDays, Check, FileText, Layers, Rocket, Users } from 'lucide-react';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Button } from '@/components/core/Button';
@@ -11,42 +11,20 @@ import {
   IndustrySelection,
   NewsletterCreateRequest,
   SourceMode,
-  StageModeConfig,
 } from '@/types/newsletter';
 
 import { IndustryPicker } from './IndustryPicker';
 import { SourcePicker } from './SourcePicker';
-import { StageAdvancedSettings } from './StageAdvancedSettings';
 
 interface Props {
   onCreate: (req: NewsletterCreateRequest) => Promise<string | null>;
   busy?: boolean;
 }
 
-const DEFAULT_MODE_CONFIG: StageModeConfig = {
-  stage_2_mode: 'planning_and_control',
-  stage_3_mode: 'planning_and_control',
-  stage_4_mode: 'planning_and_control',
-  stage_5_mode: 'planning_and_control',
-  // Stage-2 collection knobs
-  stage_2_top_companies_count: 12,
-  stage_2_min_sources: 30,
-  stage_2_enrich_with_llm: true,
-  stage_2_models: {},
-  stage_3_models: {},
-  stage_4_models: {},
-  stage_5_models: {},
-  stage_2_limits: {},
-  stage_3_limits: {},
-  stage_4_limits: {},
-  stage_5_limits: {},
-};
-
 const SECTION_META: { id: string; num: number; title: string; icon: typeof FileText }[] = [
-  { id: 'sec-scope', num: 1, title: 'Scope', icon: FileText },
+  { id: 'sec-scope', num: 1, title: 'Brief', icon: FileText },
   { id: 'sec-industries', num: 2, title: 'Industries', icon: Layers },
   { id: 'sec-sources', num: 3, title: 'Sources', icon: Users },
-  { id: 'sec-strategy', num: 4, title: 'Agent strategy', icon: Settings2 },
 ];
 
 export function SetupPanel({ onCreate, busy }: Props) {
@@ -54,14 +32,19 @@ export function SetupPanel({ onCreate, busy }: Props) {
 
   const today = todayIso();
   const [title, setTitle] = useState('');
-  const [audience, setAudience] = useState('');
+  // One free-text brief replaces the old audience / focus / tone / shape-hint
+  // fields. It is sent as `focus_prompt`; the backend uses it to steer Stage-2
+  // discovery and Stage-4 emphasis.
+  const [focusPrompt, setFocusPrompt] = useState('');
+  const [pinnedUrls] = useState<string[]>([]);
   const [dateFrom, setDateFrom] = useState(daysAgo(7));
   // End date is always today — not exposed in the UI so users always get the latest data.
   const dateTo = today;
   const [industries, setIndustries] = useState<IndustrySelection[]>([]);
   const [sourceMode, setSourceMode] = useState<SourceMode>('combined');
   const [userUrls, setUserUrls] = useState<string[]>([]);
-  const [modeConfig, setModeConfig] = useState<StageModeConfig>(DEFAULT_MODE_CONFIG);
+  const [analyzeUserLinks, setAnalyzeUserLinks] = useState(false);
+  const [executiveGrade, setExecutiveGrade] = useState(false);
 
   const [activeSection, setActiveSection] = useState<string>('sec-scope');
   const containerRef = useRef<HTMLDivElement>(null);
@@ -89,7 +72,6 @@ export function SetupPanel({ onCreate, busy }: Props) {
     'sec-scope': !!dateFrom && dateFrom <= today,
     'sec-industries': industries.length > 0 && industries.every((i) => i.sub_domains.length > 0),
     'sec-sources': sourceMode === 'ddgs_only' || userUrls.length > 0,
-    'sec-strategy': true,
   }), [dateFrom, today, industries, sourceMode, userUrls]);
 
   const scrollTo = (id: string) => {
@@ -139,8 +121,12 @@ export function SetupPanel({ onCreate, busy }: Props) {
       date_to: dateTo,
       source_mode: sourceMode,
       user_urls: userUrls,
-      audience: audience.trim() || null,
-      mode_config: modeConfig,
+      analyze_user_links: analyzeUserLinks,
+      executive_grade: executiveGrade,
+      // Single brief drives audience/focus/tone/shape on the backend.
+      focus_prompt: focusPrompt.trim() || null,
+      pinned_urls: pinnedUrls,
+      // mode_config intentionally omitted — stage strategy comes from backend .env.
     };
     await onCreate(req);
   }
@@ -281,67 +267,59 @@ export function SetupPanel({ onCreate, busy }: Props) {
 
       {/* Form column */}
       <div className="space-y-7">
-      {/* Section 1 — Newsletter scope */}
+      {/* Section 1 — Newsletter brief */}
       <Section
         id="sec-scope"
         num={1}
-        title="Newsletter scope"
-        hint="Title, audience, and the date window the newsletter should cover."
+        title="Newsletter brief"
+        hint="Describe what you want in one prompt, and pick the coverage start date."
       >
-        <div className="grid gap-3 md:grid-cols-2">
-          <div>
-            <Field icon={<FileText size={14} />} label="Newsletter title" optional>
+        <div className="grid gap-3">
+          <Field icon={<FileText size={14} />} label="What do you want this newsletter to cover?" optional>
+            <textarea
+              rows={4}
+              placeholder={"e.g. A briefing for CISOs at mid-market manufacturers on regulatory shifts and funding rounds affecting EV battery supply chains. Analytical, executive tone. Lead with an executive summary, then the top 3 stories and competitive moves."}
+              value={focusPrompt}
+              onChange={(e) => setFocusPrompt(e.target.value)}
+            />
+          </Field>
+          <div className="grid gap-3 md:grid-cols-2">
+            <Field icon={<CalendarDays size={14} />} label="Coverage start">
               <input
-                type="text"
-                placeholder={autoTitle}
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                type="date"
+                value={dateFrom}
+                max={dateTo || today}
+                onChange={(e) => setDateFrom(e.target.value)}
               />
             </Field>
-            {!title.trim() && (
-              <p
-                className="mt-1.5 flex items-center gap-1.5 text-[10px] leading-snug"
-                style={{ color: 'var(--mars-color-text-tertiary)' }}
-              >
-                <span
-                  className="rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
-                  style={{
-                    background: 'var(--mars-color-primary-subtle, rgba(139,92,246,0.18))',
-                    color: 'var(--mars-color-primary, #8b5cf6)',
-                  }}
-                >
-                  Auto
-                </span>
-                <span className="truncate">
-                  Will use <span style={{ color: 'var(--mars-color-text-secondary)' }}>{autoTitle}</span>
-                </span>
-              </p>
-            )}
+            <Field icon={<CalendarDays size={14} />} label="Coverage end (always today)" optional>
+              <input
+                type="date"
+                value={today}
+                disabled
+                style={{ opacity: 0.5, cursor: 'not-allowed' }}
+              />
+            </Field>
           </div>
-          <Field icon={<Users size={14} />} label="Audience" optional>
-            <input
-              type="text"
-              placeholder="e.g. CISOs at mid-market manufacturers"
-              value={audience}
-              onChange={(e) => setAudience(e.target.value)}
-            />
-          </Field>
-          <Field icon={<CalendarDays size={14} />} label="Coverage start">
-            <input
-              type="date"
-              value={dateFrom}
-              max={dateTo || today}
-              onChange={(e) => setDateFrom(e.target.value)}
-            />
-          </Field>
-          <Field icon={<CalendarDays size={14} />} label="Coverage end (always today)" optional>
-            <input
-              type="date"
-              value={today}
-              disabled
-              style={{ opacity: 0.5, cursor: 'not-allowed' }}
-            />
-          </Field>
+          {!title.trim() && (
+            <p
+              className="flex items-center gap-1.5 text-[10px] leading-snug"
+              style={{ color: 'var(--mars-color-text-tertiary)' }}
+            >
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
+                style={{
+                  background: 'var(--mars-color-primary-subtle, rgba(139,92,246,0.18))',
+                  color: 'var(--mars-color-primary, #8b5cf6)',
+                }}
+              >
+                Auto
+              </span>
+              <span className="truncate">
+                Title: <span style={{ color: 'var(--mars-color-text-secondary)' }}>{autoTitle}</span>
+              </span>
+            </p>
+          )}
         </div>
       </Section>
 
@@ -363,16 +341,48 @@ export function SetupPanel({ onCreate, busy }: Props) {
           onSourceModeChange={setSourceMode}
           onUserUrlsChange={setUserUrls}
         />
-      </Section>
-
-      {/* Section 4 — Per-stage agent strategy (cmbagent mode + model overrides) */}
-      <Section
-        id="sec-strategy"
-        num={4}
-        title="Per-stage agent strategy"
-        hint="Override the cmbagent invocation mode and per-role model for each AI stage."
-      >
-        <StageAdvancedSettings value={modeConfig} onChange={setModeConfig} />
+        {userUrls.length > 0 && (
+          <label
+            className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border p-3 text-xs"
+            style={{ borderColor: analyzeUserLinks ? '#8b5cf6' : 'var(--mars-color-border)' }}
+          >
+            <input
+              type="checkbox"
+              checked={analyzeUserLinks}
+              onChange={(e) => setAnalyzeUserLinks(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span style={{ color: 'var(--mars-color-text-secondary)' }}>
+              <strong style={{ color: 'var(--mars-color-text-primary)' }}>
+                Analyse my links (my organisation has access)
+              </strong>
+              <br />
+              Your links become first-class analysis targets: they are auto-pinned, never
+              skipped or filtered at any stage, and Stage 4 produces a dedicated deep analysis
+              of their content.
+            </span>
+          </label>
+        )}
+        <label
+          className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border p-3 text-xs"
+          style={{ borderColor: executiveGrade ? '#8b5cf6' : 'var(--mars-color-border)' }}
+        >
+          <input
+            type="checkbox"
+            checked={executiveGrade}
+            onChange={(e) => setExecutiveGrade(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span style={{ color: 'var(--mars-color-text-secondary)' }}>
+            <strong style={{ color: 'var(--mars-color-text-primary)' }}>
+              Executive-grade report (CEO / CTO)
+            </strong>
+            <br />
+            Auto-runs a mars_cmbagent deep-research pass on the hero sections (Executive
+            Summary, Top Story, Focus Topic Deep Dive, Trend Intelligence, Forward-Looking)
+            for research-grade synthesis. Slower but noticeably higher quality.
+          </span>
+        </label>
       </Section>
 
       {validation.length > 0 && (

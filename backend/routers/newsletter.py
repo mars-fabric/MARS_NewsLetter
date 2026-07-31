@@ -30,6 +30,7 @@ from execution.cost_collector import CostCollector
 from models.newsletter_schemas import (
     CmbAgentMode,
     CompilePdfResponse,
+    LinkPrioritiesRequest,
     NewsletterContentUpdateRequest,
     NewsletterCreateRequest,
     NewsletterCreateResponse,
@@ -37,6 +38,7 @@ from models.newsletter_schemas import (
     NewsletterRecentTaskResponse,
     NewsletterStageResponse,
     NewsletterTaskStateResponse,
+    ReportTemplateRequest,
     StageContentResponse,
 )
 from services import session_manager, taxonomy_service
@@ -257,6 +259,115 @@ async def create_task(req: NewsletterCreateRequest) -> NewsletterCreateResponse:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Canonical section list (Gate B helper)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get("/canonical-sections")
+async def get_canonical_sections() -> Dict[str, Any]:
+    """Return the 22 canonical section headings and their drafting guidance.
+
+    The frontend uses this to populate the Gate B "add from predefined" picker
+    so users don't have to type common section names from scratch.
+    """
+    from task_framework.newsletter.stage4.sections import CANONICAL_SECTIONS
+    return {
+        "sections": [
+            {
+                "number": s.number,
+                "heading": s.heading,
+                "guidance": s.guidance,
+                "target_words": s.target_words,
+            }
+            for s in CANONICAL_SECTIONS
+        ]
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gates — user decisions between stages (Gate A: links, Gate B: template)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _resolve_work_dir(task_id: str) -> str:
+    db = _get_db()
+    try:
+        from cmbagent.database.models import WorkflowRun  # type: ignore
+        run = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+        if run is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return _work_dir_for(task_id, run.session_id, base=None)
+    finally:
+        db.close()
+
+
+@router.post("/{task_id}/gate/links", response_model=NewsletterStageResponse)
+async def set_link_priorities(task_id: str, req: LinkPrioritiesRequest) -> NewsletterStageResponse:
+    """Gate A — persist user link prioritization applied before Stage 3 curation."""
+    work_dir = _resolve_work_dir(task_id)
+    excluded = [p.url for p in req.priorities if p.action.value == "exclude"]
+    priorities = [
+        {"url": p.url, "action": p.action.value, "weight": p.weight}
+        for p in req.priorities
+    ]
+    changes: Dict[str, Any] = {
+        "link_priorities": priorities,
+        "excluded_urls": excluded,
+    }
+    if req.add_urls:
+        # Auto-pin user-injected URLs so they survive curation.
+        priorities.extend({"url": u, "action": "pin", "weight": 1.0} for u in req.add_urls)
+        changes["link_priorities"] = priorities
+    if req.min_relevance is not None:
+        changes["min_relevance"] = req.min_relevance
+    session_manager.update_setup(work_dir, **changes)
+    logger.info("gate_links_saved", task_id=task_id, priorities=len(priorities), excluded=len(excluded))
+    return NewsletterStageResponse(
+        stage_number=3, stage_name="curation", status="gate_saved",
+    )
+
+
+@router.post("/{task_id}/gate/template", response_model=NewsletterStageResponse)
+async def set_report_template(task_id: str, req: ReportTemplateRequest) -> NewsletterStageResponse:
+    """Gate B — persist the user's section template applied before Stage 4 generation."""
+    work_dir = _resolve_work_dir(task_id)
+    template = [
+        {
+            "title": s.title,
+            "depth": s.depth.value,
+            "points": s.points,
+            "guidance": s.guidance,
+            "word_count": s.word_count,
+        }
+        for s in req.sections
+    ]
+    changes: Dict[str, Any] = {"report_template": template}
+    if req.tone is not None:
+        changes["template_tone"] = req.tone
+    if req.audience is not None:
+        changes["template_audience"] = req.audience
+    session_manager.update_setup(work_dir, **changes)
+    logger.info("gate_template_saved", task_id=task_id, sections=len(template))
+    return NewsletterStageResponse(
+        stage_number=4, stage_name="generation", status="gate_saved",
+    )
+
+
+@router.get("/{task_id}/gate")
+async def get_gate_state(task_id: str) -> Dict[str, Any]:
+    """Return the currently persisted gate decisions for the UI to rehydrate."""
+    work_dir = _resolve_work_dir(task_id)
+    setup = session_manager.load_setup(work_dir) or {}
+    return {
+        "link_priorities": setup.get("link_priorities", []),
+        "excluded_urls": setup.get("excluded_urls", []),
+        "min_relevance": setup.get("min_relevance"),
+        "report_template": setup.get("report_template", []),
+        "template_tone": setup.get("template_tone"),
+        "template_audience": setup.get("template_audience"),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Execute a stage
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -342,6 +453,16 @@ async def _run_stage_background(
         try:
             shared = _build_shared_state(task_id, up_to_stage=stage_num, db=db, session_id=session_id)
             setup = shared.get("setup") or session_manager.load_setup(work_dir) or {}
+            # Merge gate decisions (Gate A link priorities, Gate B report
+            # template) persisted to disk after Stage 1 — the stage-1 shared
+            # payload predates them, so disk wins for these keys.
+            disk_setup = session_manager.load_setup(work_dir) or {}
+            for _gk in (
+                "link_priorities", "min_relevance", "excluded_urls",
+                "report_template", "template_tone", "template_audience",
+            ):
+                if _gk in disk_setup:
+                    setup[_gk] = disk_setup[_gk]
             mode_for_record = (mode_override.value if mode_override else
                                setup.get("mode_config", {}).get(f"stage_{stage_num}_mode"))
 
@@ -501,7 +622,6 @@ async def get_stage_content(task_id: str, stage_num: int) -> StageContentRespons
             shared_state=shared,
             output_files=files,
             link_validation=shared.get("link_validation") if stage_num == 2 else None,
-            score_card=shared.get("score_card") if stage_num == 5 else None,
         )
     finally:
         db.close()
@@ -762,164 +882,3 @@ async def regenerate_pdf(task_id: str) -> CompilePdfResponse:
         backend_used=pdf.backend,
         error=pdf.error,
     )
-
-
-@router.get("/{task_id}/dashboard")
-async def get_dashboard(task_id: str) -> Dict[str, Any]:
-    """Return the Stage-5 quality dashboard payload for a task.
-
-    Pulls together: score card, evaluation aggregate, URL-verification
-    summary, critic corrections + DDGS findings, dashboard chart payload,
-    and node timings — everything the frontend Quality tab needs in one call.
-
-    Falls back to disk files when the in-DB shared state hasn't been
-    backfilled (e.g. for tasks created before the LangGraph stage 5 landed).
-    """
-    db = _get_db()
-    try:
-        from cmbagent.database.models import WorkflowRun  # type: ignore
-        run = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
-        if run is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        repo = _stage_repo(db, session_id=run.session_id)
-        stage = next((s for s in repo.list_stages(parent_run_id=task_id) if s.stage_number == 5), None)
-        shared: Dict[str, Any] = {}
-        if stage is not None and (stage.output_data or {}).get("shared"):
-            shared = stage.output_data["shared"]
-        work_dir = _work_dir_for(task_id, run.session_id, base=None)
-    finally:
-        db.close()
-
-    stage5_dir = os.path.join(work_dir, "stage_5")
-
-    def _load_json(name: str) -> Any:
-        p = os.path.join(stage5_dir, name)
-        if not os.path.isfile(p):
-            return None
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                import json as _json
-                return _json.load(f)
-        except Exception:
-            return None
-
-    dashboard = shared.get("stage5_dashboard") or _load_json("dashboard.json") or {}
-    dashboard_metrics = shared.get("stage5_dashboard_metrics") or {}
-    aggregate = shared.get("stage5_aggregate") or _load_json("evaluation.json") or {}
-    score_card = shared.get("score_card") or _load_json("score_card.json") or {}
-    url_verification = shared.get("stage5_url_verification") or _load_json("url_verification.json") or {}
-    critic = shared.get("stage5_critic") or _load_json("critic_report.json") or {}
-    timings = shared.get("stage5_timings") or {}
-    notes = shared.get("verification_notes") or []
-
-    return {
-        "task_id": task_id,
-        "stage_5_status": getattr(stage, "status", None) if stage else None,
-        "score_card": score_card,
-        "aggregate": aggregate,
-        "dashboard": dashboard,
-        "dashboard_metrics": dashboard_metrics,
-        "url_verification": url_verification,
-        "critic": critic,
-        "verification_notes": notes,
-        "node_timings": timings,
-        "pdf_path": shared.get("pdf_path"),
-    }
-
-
-@router.post("/{task_id}/repair-score-card")
-async def repair_score_card(task_id: str) -> Dict[str, Any]:
-    """Re-parse the latest score-card LLM output from disk and refresh the
-    score block at the bottom of ``newsletter_final.md``. No LLM call.
-
-    Use case: the score-card parser was tightened (e.g. to handle cmbagent's
-    ``content = '...'`` python-save-script wrapper) but a previous run's
-    ``score_card.json`` was written with the old fallback values. This endpoint
-    repairs that without forcing a paid Stage-5 re-run.
-    """
-    from task_framework.newsletter.programmatic_verification import parse_score_card
-
-    db = _get_db()
-    try:
-        from cmbagent.database.models import WorkflowRun  # type: ignore
-        run = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
-        if run is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        work_dir = _work_dir_for(task_id, run.session_id, base=None)
-    finally:
-        db.close()
-
-    final_md_path = os.path.join(work_dir, "stage_5", nl.stage_def(5)["file"])
-    if not os.path.isfile(final_md_path):
-        raise HTTPException(status_code=400, detail="Stage 5 has not been completed yet")
-
-    # The score-card LLM output is the most recently-modified ``tmp_code_*.py``
-    # whose body contains a ``json`` fenced block — that's the
-    # researcher_response_formatter's save-to-file wrapper for the score card.
-    candidates = []
-    for name in os.listdir(work_dir):
-        if not name.startswith("tmp_code_") or not name.endswith(".py"):
-            continue
-        path = os.path.join(work_dir, name)
-        try:
-            text = open(path, "r", encoding="utf-8", errors="replace").read()
-        except OSError:
-            continue
-        if "authenticity_score" in text and "verdict" in text:
-            candidates.append((os.path.getmtime(path), path, text))
-    candidates.sort(reverse=True)
-    if not candidates:
-        raise HTTPException(
-            status_code=400,
-            detail="No score-card LLM output found in the work directory.",
-        )
-
-    raw = candidates[0][2]
-    score_card = parse_score_card(raw)
-
-    # Persist the refreshed score-card JSON.
-    score_path = os.path.join(work_dir, "stage_5", "score_card.json")
-    with open(score_path, "w", encoding="utf-8") as f:
-        f.write(__import__("json").dumps(score_card, indent=2, default=str))
-
-    # Strip the old score block + any empty-stub sections the legacy verifier
-    # appended, then re-append a fresh score block with the corrected card.
-    with open(final_md_path, "r", encoding="utf-8") as f:
-        existing = f.read()
-    notes_path = os.path.join(work_dir, "stage_5", "verification_notes.md")
-    notes_lines: List[str] = []
-    if os.path.isfile(notes_path):
-        with open(notes_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("- "):
-                    notes_lines.append(line[2:].strip())
-    body = nl.strip_score_section(existing)
-    body, stubs_removed = nl.strip_empty_stub_sections(body)
-    if stubs_removed:
-        # Refresh the verification notes file too so the UI doesn't keep
-        # surfacing stale "Added missing section" entries that no longer apply.
-        new_notes = [n for n in notes_lines if not n.lower().startswith("added missing section")]
-        new_notes.append(
-            f"Cleanup: removed {stubs_removed} empty stub section(s) appended by an earlier run."
-        )
-        with open(notes_path, "w", encoding="utf-8") as f:
-            f.write("# Verification notes\n\n" + "\n".join(f"- {n}" for n in new_notes) + "\n")
-        notes_lines = new_notes
-    rebuilt = nl.append_score_section(body, score_card, notes_lines)
-    with open(final_md_path, "w", encoding="utf-8") as f:
-        f.write(rebuilt)
-
-    # Re-render the PDF so the downloadable copy reflects the corrected score.
-    setup = session_manager.load_setup(work_dir) or {}
-    industry_titles = ", ".join(i["industry"] for i in setup.get("industries", [])) or "Newsletter"
-    title = f"{industry_titles} — {setup.get('date_from')} to {setup.get('date_to')}"
-    pdf = render_pdf(markdown_text=rebuilt, output_dir=os.path.join(work_dir, "stage_5"), title=title)
-
-    return {
-        "score_card": score_card,
-        "score_card_path": score_path,
-        "final_md_path": final_md_path,
-        "pdf_path": pdf.pdf_path,
-        "pdf_success": pdf.success,
-        "source_script": candidates[0][1],
-    }

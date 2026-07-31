@@ -62,12 +62,46 @@ STAGE_DEFS: List[Dict[str, Any]] = [
     {"number": 2, "name": "source_collection", "shared_key": "raw_sources", "file": "raw_sources.md"},
     {"number": 3, "name": "curation",          "shared_key": "curated",     "file": "curated.md"},
     {"number": 4, "name": "generation",        "shared_key": "draft",       "file": "newsletter_draft.md"},
-    {"number": 5, "name": "review",            "shared_key": "final",       "file": "newsletter_final.md"},
+    {"number": 5, "name": "report",            "shared_key": "final",       "file": "newsletter_final.md"},
 ]
 
 
 def stage_def(stage_num: int) -> Dict[str, Any]:
     return STAGE_DEFS[stage_num - 1]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    import os
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _strip_excluded_urls(md: str, excluded: set) -> str:
+    """Remove lines/links referencing user-excluded URLs from the raw set."""
+    if not excluded:
+        return md
+    kept_lines: List[str] = []
+    for line in (md or "").splitlines():
+        if any(u in line for u in excluded):
+            stripped = line.strip()
+            # Drop bullet/table/prose lines that reference an excluded URL.
+            if stripped.startswith(("-", "*", "|")) or "http" in stripped:
+                continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines)
 
 
 def stage_model_overrides(setup: Dict[str, Any], stage_num: int) -> Dict[str, Any]:
@@ -117,9 +151,26 @@ def _stage_mode(setup: Dict[str, Any], stage_num: int,
     if override is not None:
         return override
     raw = (setup.get("mode_config") or {}).get(f"stage_{stage_num}_mode")
-    if not raw:
-        return CmbAgentMode.ONE_SHOT
-    return CmbAgentMode(raw)
+    if raw:
+        try:
+            return CmbAgentMode(raw)
+        except ValueError:
+            pass
+    # Config now comes from the environment (the per-stage UI was removed).
+    # NEWSLETTER_STAGE_{n}_MODE overrides a specific stage; NEWSLETTER_DEFAULT_MODE
+    # sets the fallback for every stage. Absent both, default to one_shot.
+    import os
+    env_raw = (
+        os.getenv(f"NEWSLETTER_STAGE_{stage_num}_MODE")
+        or os.getenv("NEWSLETTER_DEFAULT_MODE")
+        or ""
+    ).strip()
+    if env_raw:
+        try:
+            return CmbAgentMode(env_raw)
+        except ValueError:
+            logger.warning("newsletter_invalid_env_stage_mode", stage=stage_num, value=env_raw)
+    return CmbAgentMode.ONE_SHOT
 
 
 def _write(work_dir: str, stage_num: int, filename: str, content: str) -> str:
@@ -251,9 +302,9 @@ async def run_stage_2(
     ]
     source_mode = SourceMode(setup.get("source_mode", SourceMode.COMBINED.value))
     mc = setup.get("mode_config", {}) or {}
-    enrich_with_llm = bool(mc.get("stage_2_enrich_with_llm", True))
-    top_n = int(mc.get("stage_2_top_companies_count", 12))
-    min_sources = int(mc.get("stage_2_min_sources", 30))
+    enrich_with_llm = bool(mc.get("stage_2_enrich_with_llm", _env_flag("NEWSLETTER_STAGE_2_ENRICH", True)))
+    top_n = int(mc.get("stage_2_top_companies_count", _env_int("NEWSLETTER_STAGE_2_TOP_COMPANIES", 12)))
+    min_sources = int(mc.get("stage_2_min_sources", _env_int("NEWSLETTER_STAGE_2_MIN_SOURCES", 30)))
 
     mode = _stage_mode(setup, 2, mode_override)
     merged = merge_overrides(setup, 2, config_overrides)
@@ -272,6 +323,7 @@ async def run_stage_2(
         mode=mode,
         top_companies_count=top_n,
         min_sources=min_sources,
+        analyze_user_links=bool(setup.get("analyze_user_links")),
     )
 
     raw_path = _write(work_dir, 2, stage_def(2)["file"], raw_md)
@@ -279,6 +331,28 @@ async def run_stage_2(
         work_dir, 2, "link_validation.json",
         _json_dump([r.to_dict() for r in validation]),
     )
+
+    # ── Authentic-link enforcement — fetch-verify EVERY discovered URL ───────
+    # The DDGS researcher can emit URLs it never actually fetched (real-looking
+    # but 404/hallucinated). We fetch-check the entire raw collection here so a
+    # broken link never propagates past Stage 2. User-pinned URLs are always
+    # kept. This is the core fix for the "broken / unauthentic links" problem.
+    pinned = set(setup.get("pinned_urls") or [])
+    raw_md, stage2_url_health = await _verify_curated_urls(raw_md, keep_urls=pinned)
+    raw_path = _write(work_dir, 2, stage_def(2)["file"], raw_md)
+    if stage2_url_health.get("total"):
+        source_verify_path = _write(
+            work_dir, 2, "source_verification.json", _json_dump(stage2_url_health),
+        )
+        logger.info(
+            "stage_2_url_verification",
+            total=stage2_url_health.get("total"),
+            reachable=stage2_url_health.get("reachable"),
+            stripped=stage2_url_health.get("stripped"),
+        )
+    else:
+        source_verify_path = None
+
     companies_path = _write(
         work_dir, 2, "top_companies.json",
         _json_dump(seed_companies),
@@ -288,8 +362,12 @@ async def run_stage_2(
         "raw_sources": raw_md,
         "link_validation": [r.to_dict() for r in validation],
         "top_companies": seed_companies,
+        "stage2_url_health": stage2_url_health,
     }
-    return shared, raw_md, [raw_path, validation_path, companies_path]
+    files = [raw_path, validation_path, companies_path]
+    if source_verify_path:
+        files.append(source_verify_path)
+    return shared, raw_md, files
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -310,9 +388,30 @@ async def run_stage_3(
     for i in setup.get("industries", []):
         sub_domains.extend(i.get("sub_domains", []))
 
+    # ── Gate A — user link decisions (pin / boost / exclude) ────────────────
+    priorities = setup.get("link_priorities") or []
+    pinned_urls = [
+        p.get("url") for p in priorities
+        if p.get("url") and p.get("action") in ("pin", "boost")
+    ]
+    # Pinned URLs also come from Stage-1 ``pinned_urls`` (trusted seeds).
+    pinned_urls.extend(u for u in (setup.get("pinned_urls") or []) if u not in pinned_urls)
+    # When the user asked to analyse their own links, those links are
+    # first-class and must NEVER be skipped or filtered — auto-pin every one.
+    if setup.get("analyze_user_links"):
+        pinned_urls.extend(u for u in (setup.get("user_urls") or []) if u not in pinned_urls)
+    excluded_urls = set(setup.get("excluded_urls") or [])
+    # A user-excluded URL never overrides an explicit analyse-my-links pin.
+    excluded_urls -= set(pinned_urls)
+
     mode = _stage_mode(setup, 3, mode_override)
     merged = merge_overrides(setup, 3, config_overrides)
     merged = _pin_single_step_researcher(merged)
+
+    # Strip user-excluded URLs from the raw collection before curation so the
+    # curator never even considers them.
+    if excluded_urls:
+        raw_sources = _strip_excluded_urls(raw_sources, excluded_urls)
 
     prompt = curation_prompt(
         raw_collection=raw_sources,
@@ -322,6 +421,17 @@ async def run_stage_3(
         date_to=setup["date_to"],
         audience=setup.get("audience"),
     )
+
+    # Inject user link-prioritization guidance so pinned/boosted links are
+    # always preserved and ranked at the top of the curated set.
+    if pinned_urls:
+        prompt += (
+            "\n\n## USER-PRIORITIZED LINKS (MUST KEEP)\n"
+            "The user explicitly pinned the following URLs. You MUST retain every "
+            "one of them in the curated output, cite them accurately, and rank "
+            "them among the top items. Do not drop them for any reason:\n"
+            + "\n".join(f"- {u}" for u in pinned_urls)
+        )
 
     if mode == CmbAgentMode.PLANNING_AND_CONTROL:
         researcher_instructions = (
@@ -362,19 +472,20 @@ async def run_stage_3(
     # allow-list. ``tier=dead`` and ``tier=error`` URLs are stripped from
     # the curated markdown (the visible text stays). ``tier=blocked`` URLs
     # (live but CDN-anti-bot) are preserved.
-    curated, stage3_url_health = await _verify_curated_urls(curated)
+    curated, stage3_url_health = await _verify_curated_urls(curated, keep_urls=set(pinned_urls))
 
     # Deterministic quality filter: enforce strict date window + authority-
-    # domain preference. The LLM curator can leave stale (2024-dated) items
-    # in the set or list a low-authority third-party as `Primary source`
-    # even when a vendor-official URL is present in `Also covered by`.
-    # This filter drops out-of-window items and swaps Primary/Also links so
-    # the canonical vendor URL always wins. See ``curated_quality_filter``.
-    curated, quality_report = apply_quality_filter(
-        curated,
-        date_from=setup["date_from"],
-        date_to=setup["date_to"],
-    )
+    # domain preference. Skip entirely for user_links_only — the user supplied
+    # the URLs explicitly so we keep every reachable one regardless of date.
+    source_mode = SourceMode(setup.get("source_mode", SourceMode.COMBINED.value))
+    if source_mode == SourceMode.USER_LINKS_ONLY:
+        quality_report: Dict[str, Any] = {"kept": 0, "dropped": 0, "swaps": 0, "skipped": "user_links_only"}
+    else:
+        curated, quality_report = apply_quality_filter(
+            curated,
+            date_from=setup["date_from"],
+            date_to=setup["date_to"],
+        )
 
     path = _write(work_dir, 3, stage_def(3)["file"], curated)
     files = [path]
@@ -411,16 +522,21 @@ async def run_stage_3(
     )
 
 
-async def _verify_curated_urls(curated_md: str) -> Tuple[str, Dict[str, Any]]:
+async def _verify_curated_urls(curated_md: str, keep_urls: Optional[set] = None) -> Tuple[str, Dict[str, Any]]:
     """HEAD-/GET-check every URL in the curated markdown and strip dead ones.
 
     Returns ``(cleaned_curated_md, health_summary)``. The summary contains
     per-URL results plus aggregates and the count of URLs we removed. The
     markdown stripping keeps visible link text (``[text](dead-url)`` →
     ``text``) so the curator's prose remains readable, just unlinked.
+
+    ``keep_urls`` are user-pinned URLs that must never be stripped even if the
+    reachability check fails (anti-bot CDNs, transient errors).
     """
     import re as _re
     from .url_health import check_urls, summarise
+
+    keep_urls = keep_urls or set()
 
     urls = sorted({
         u.rstrip(".,;:!?'\"]>")
@@ -433,7 +549,11 @@ async def _verify_curated_urls(curated_md: str) -> Tuple[str, Dict[str, Any]]:
     summary = summarise(results)
 
     # Identify URLs to strip (genuinely dead — 404/410 + other 4xx + DNS errors).
-    dead_urls = {r["url"] for r in results if r.get("tier") in ("dead", "error")}
+    # Never strip user-pinned URLs.
+    dead_urls = {
+        r["url"] for r in results
+        if r.get("tier") in ("dead", "error") and r["url"] not in keep_urls
+    }
     if not dead_urls:
         summary["stripped"] = 0
         summary["stripped_urls"] = []
@@ -489,14 +609,14 @@ async def run_stage_4(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Stage 5 — Review (LangGraph pipeline: verify URLs → critic → editor → scorer → PDF)
+# Stage 5 — Dynamic report builder (MD → JSON → HTML + PDF)
 # ──────────────────────────────────────────────────────────────────────────────
 #
-# The implementation lives in ``stage5/graph.py`` and its per-node code in
-# ``stage5/nodes.py``. It runs a 22-node LangGraph DAG that verifies every
-# URL, has the LLM critic re-check factual claims with DDGS, applies the
-# editor's fixes, runs the deterministic ``verify_and_clean`` safety net,
-# scores the newsletter, and renders the PDF.
+# The legacy review/score/critique LangGraph has been retired. Stage 5 now
+# breaks the Stage-4 markdown draft into a structured JSON document (sections +
+# content + links + subsections), enhances each section with an LLM pass,
+# validates every link, then renders an HTML view and a PDF from the single
+# JSON source of truth. Implementation lives in ``stage5_report/``.
 
 async def run_stage_5(
     *,
@@ -508,8 +628,8 @@ async def run_stage_5(
     config_overrides: Optional[Dict[str, Any]] = None,
     cost_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[Dict[str, Any], str, List[str]]:
-    from .stage5 import run_stage_5_langgraph
-    return await run_stage_5_langgraph(
+    from .stage5_report import run_stage_5_report
+    return await run_stage_5_report(
         work_dir=work_dir, setup=setup, draft=draft, curated=curated,
         mode_override=mode_override, config_overrides=config_overrides,
         cost_callback=cost_callback,

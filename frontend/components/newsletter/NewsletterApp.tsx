@@ -20,6 +20,10 @@ import {
 
 import { SetupPanel } from './SetupPanel';
 import { StageCard } from './StageCard';
+import { GateLinks } from './GateLinks';
+import { GateTemplate } from './GateTemplate';
+import { ReportView } from './ReportView';
+import { LinkPriority, SectionSpecRequest } from '@/types/newsletter';
 
 interface NewsletterAppProps {
   resumeTaskId?: string | null;
@@ -135,6 +139,23 @@ export function NewsletterApp({ resumeTaskId = null, onBack, onTaskCreated }: Ne
     const { mode_override, config_overrides } = buildOverridesForStage(stageNum);
     void t.executeStage(t.taskId, stageNum, { mode_override, config_overrides });
   }
+
+  // Gate A — save link priorities before Stage 3.
+  const saveLinkGate = async (priorities: LinkPriority[], addUrls: string[], minRelevance: number | null) => {
+    if (!t.taskId) return;
+    await t.setLinkPriorities(t.taskId, { priorities, add_urls: addUrls, min_relevance: minRelevance });
+  };
+
+  // Gate B — save section template before Stage 4.
+  const saveTemplateGate = async (sections: SectionSpecRequest[], tone: string | null, audience: string | null) => {
+    if (!t.taskId) return;
+    await t.setReportTemplate(t.taskId, { sections, tone, audience });
+  };
+
+  const stageStatus = (n: number) => t.task?.stages.find((s) => s.stage_number === n)?.status;
+  const shapeHint = t.task?.setup?.shape_hint ?? null;
+  const stage2Content = t.stageContent[2]?.content ?? '';
+  const stage5Content = t.stageContent[5];
 
   return (
     <div className="mx-auto max-w-6xl space-y-5 p-6">
@@ -268,19 +289,45 @@ export function NewsletterApp({ resumeTaskId = null, onBack, onTaskCreated }: Ne
         )
       ) : (
         liveModeConfig && t.task && t.taskId && activeStageInfo && (
-          <StageCard
-            taskId={t.taskId}
-            stage={activeStageInfo}
-            stageContent={t.stageContent[activeStage] ?? null}
-            consoleLines={t.console}
-            modeConfig={liveModeConfig}
-            onModeConfigChange={setLiveModeConfig}
-            onExecute={() => executeStage(activeStage)}
-            onUpdateContent={(content) => t.updateStageContent(t.taskId as string, activeStage, content)}
-            onRegeneratePdf={activeStage === 5 ? () => t.regeneratePdf(t.taskId as string) : undefined}
-            workDir={t.task.work_dir ?? ''}
-            busy={t.loading}
-          />
+          <div className="space-y-5">
+            {/* Gate A — link prioritization, shown before Stage 3 once Stage 2 is done. */}
+            {activeStage === 3 && stageStatus(2) === 'completed' && (
+              <GateLinks
+                sourceMarkdown={stage2Content}
+                busy={t.loading}
+                onSave={saveLinkGate}
+              />
+            )}
+            {/* Gate B — report template, shown before Stage 4 once Stage 3 is done. */}
+            {activeStage === 4 && stageStatus(3) === 'completed' && (
+              <GateTemplate
+                shapeHint={shapeHint}
+                busy={t.loading}
+                onSave={saveTemplateGate}
+              />
+            )}
+            {/* Stage 5 — dynamic report view once the report has been built. */}
+            {activeStage === 5 && stageStatus(5) === 'completed' && (
+              <ReportView
+                pdfPath={(stage5Content?.shared_state as Record<string, unknown>)?.pdf_path as string | null ?? null}
+                workDir={t.task.work_dir ?? ''}
+                outputFiles={stage5Content?.output_files ?? null}
+              />
+            )}
+            <StageCard
+              taskId={t.taskId}
+              stage={activeStageInfo}
+              stageContent={t.stageContent[activeStage] ?? null}
+              consoleLines={t.console}
+              modeConfig={liveModeConfig}
+              onModeConfigChange={setLiveModeConfig}
+              onExecute={() => executeStage(activeStage)}
+              onUpdateContent={(content) => t.updateStageContent(t.taskId as string, activeStage, content)}
+              onRegeneratePdf={activeStage === 5 ? () => t.regeneratePdf(t.taskId as string) : undefined}
+              workDir={t.task.work_dir ?? ''}
+              busy={t.loading}
+            />
+          </div>
         )
       )}
     </div>

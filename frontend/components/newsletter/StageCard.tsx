@@ -1,7 +1,6 @@
 'use client';
 
 import {
-  Award,
   CheckCircle2,
   Download,
   Eye,
@@ -24,14 +23,12 @@ import {
   STAGE_ACCENT,
   STAGE_DESCRIPTIONS,
   STAGE_NAMES,
-  ScoreCard as ScoreCardType,
   StageContent,
   StageInfo,
   StageModeConfig,
 } from '@/types/newsletter';
 
 import { ConsoleOutput } from './ConsoleOutput';
-import { QualityDashboard } from './QualityDashboard';
 import { StageAdvancedSettings } from './StageAdvancedSettings';
 
 interface Props {
@@ -50,13 +47,13 @@ interface Props {
 
 type ViewMode = 'preview' | 'edit';
 
-function downloadMarkdown(content: string) {
+function downloadHtml(content: string) {
   if (typeof window === 'undefined' || !content) return;
-  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  const blob = new Blob([content], { type: 'text/html;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'newsletter.md';
+  link.download = 'newsletter.html';
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -120,8 +117,10 @@ export function StageCard({
     }
   }
 
-  // PDF / score card surfaced on Stage 5.
-  const scoreCard = (stageContent?.score_card ?? null) as ScoreCardType | null;
+  // PDF / HTML surfaced on Stage 5.
+  const reportHtml: string =
+    (stageContent?.shared_state?.['report_html'] as string | undefined)
+    ?? (stageContent?.content ?? draft);
   const pdfPath: string | null =
     pdfStatus?.pdf_path
     ?? (stageContent?.shared_state?.['pdf_path'] as string | undefined)
@@ -242,14 +241,6 @@ export function StageCard({
         />
       </div>
 
-      {/* Score card + Quality dashboard — Stage 5 only, when output is available. */}
-      {stage.stage_number === 5 && isDone && scoreCard && (
-        <div className="mt-4 space-y-4">
-          <ScoreCardView score={scoreCard} accent={accent} />
-          <QualityDashboard taskId={taskId} accent={accent} />
-        </div>
-      )}
-
       {/* Output preview / editor — only when stage has content. */}
       {isDone && stageContent && (
         <div className="mt-4 space-y-3">
@@ -297,10 +288,10 @@ export function StageCard({
                   </Button>
                   <Button
                     variant="secondary"
-                    onClick={() => downloadMarkdown(stageContent?.content ?? draft)}
-                    disabled={!(stageContent?.content || draft)}
+                    onClick={() => downloadHtml(reportHtml)}
+                    disabled={!reportHtml}
                   >
-                    <FileCode2 size={13} /> Download Markdown
+                    <FileCode2 size={13} /> Download HTML
                   </Button>
                   {pdfPath && (
                     <Button
@@ -369,100 +360,5 @@ export function StageCard({
         </div>
       )}
     </Card>
-  );
-}
-
-function ScoreCardView({ score, accent }: { score: ScoreCardType; accent: string }) {
-  const verdictColor =
-    score.verdict === 'production-ready'
-      ? '#22c55e'
-      : score.verdict === 'reject'
-        ? '#ef4444'
-        : '#f59e0b';
-  const subScores: { label: string; value: number | null | undefined }[] = [
-    { label: 'Citations', value: score.citation_score },
-    { label: 'Factual fidelity', value: score.factual_fidelity_score },
-    { label: 'Coverage', value: score.coverage_score },
-    { label: 'Structural completeness', value: score.structural_completeness_score },
-  ];
-  return (
-    <div
-      className="overflow-hidden rounded-xl border"
-      style={{
-        borderColor: `${accent}55`,
-        background: `linear-gradient(135deg, ${accent}10, var(--mars-color-surface-raised))`,
-        boxShadow: `inset 0 1px 0 rgba(255,255,255,0.04), 0 6px 18px -6px ${accent}55`,
-      }}
-    >
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-        <div className="flex items-center gap-3">
-          <Award className="h-5 w-5" style={{ color: accent }} />
-          <div>
-            <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-              Newsletter quality score
-            </div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold tabular-nums" style={{ color: 'var(--mars-color-text)' }}>
-                {score.authenticity_score}
-              </span>
-              <span className="text-xs" style={{ color: 'var(--mars-color-text-tertiary)' }}>/ 100</span>
-            </div>
-          </div>
-        </div>
-        <span
-          className="rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wider"
-          style={{
-            background: `${verdictColor}22`,
-            color: verdictColor,
-            border: `1px solid ${verdictColor}55`,
-            boxShadow: `0 0 10px ${verdictColor}33`,
-          }}
-        >
-          {score.verdict}
-        </span>
-      </div>
-
-      <div className="grid gap-2 px-4 pb-4 md:grid-cols-4">
-        {subScores.map((s) => (
-          <div
-            key={s.label}
-            className="rounded-lg p-2"
-            style={{ background: 'var(--mars-color-surface-sunken)', border: '1px solid var(--mars-color-border)' }}
-          >
-            <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-              {s.label}
-            </div>
-            <div className="font-mono text-sm tabular-nums" style={{ color: 'var(--mars-color-text)' }}>
-              {s.value == null ? 'n/a' : `${s.value}`}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {score.suggestions && score.suggestions.length > 0 && (
-        <div
-          className="px-4 pb-4"
-          style={{ borderTop: '1px solid var(--mars-color-border)' }}
-        >
-          <div className="mt-3 text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-            Reviewer suggestions
-          </div>
-          <ul className="mt-1 list-disc space-y-1 pl-5 text-xs" style={{ color: 'var(--mars-color-text-secondary)' }}>
-            {score.suggestions.map((s, i) => (
-              <li key={i}>{s}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {score.notes && (
-        <div className="px-4 pb-4 text-xs" style={{ color: 'var(--mars-color-text-secondary)' }}>
-          <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-            Reviewer notes
-          </div>
-          <div className="mt-1">{score.notes}</div>
-        </div>
-      )}
-    </div>
   );
 }

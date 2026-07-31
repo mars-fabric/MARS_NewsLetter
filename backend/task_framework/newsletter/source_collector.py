@@ -27,6 +27,7 @@ the parsed list of seed companies (used by the writer in Stage 4).
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -66,6 +67,7 @@ async def collect_sources(
     mode: CmbAgentMode = CmbAgentMode.PLANNING_AND_CONTROL,
     top_companies_count: int = 12,
     min_sources: int = 30,
+    analyze_user_links: bool = False,
 ) -> Tuple[str, List[LinkResult], List[Dict[str, str]]]:
     industries = [i for i, _ in industries_with_subdomains]
     sub_domains: List[str] = []
@@ -81,16 +83,24 @@ async def collect_sources(
         # Soft relevance gate — only drop a user URL when the model explicitly
         # says it's unrelated to the industries. "unknown" / "borderline"
         # verdicts keep the link in the set; the user added it for a reason.
-        validation = await _gate_user_urls_relevance(
-            validation=validation, industries=industries, sub_domains=sub_domains,
-            work_dir=work_dir, mode=mode, config_overrides=config_overrides,
-            cost_callback=cost_callback,
-        )
+        #
+        # When ``analyze_user_links`` is set the user explicitly wants their
+        # own sources analysed (their org has authorised access), so we skip
+        # the relevance gate entirely — these links are never dropped.
+        # Skip the relevance gate for user_links_only: the user explicitly
+        # supplied these URLs — trust them without an extra LLM round-trip.
+        if not analyze_user_links and source_mode != SourceMode.USER_LINKS_ONLY:
+            validation = await _gate_user_urls_relevance(
+                validation=validation, industries=industries, sub_domains=sub_domains,
+                work_dir=work_dir, mode=mode, config_overrides=config_overrides,
+                cost_callback=cost_callback,
+            )
         logger.info(
             "user_urls_validated",
             total=len(validation),
             reachable=sum(1 for r in validation if r.reachable),
             authentic=sum(1 for r in validation if r.is_authentic),
+            analyze_user_links=analyze_user_links,
             kept_after_relevance_gate=sum(1 for r in validation if (r.notes or "").lower() != "dropped: unrelated"),
         )
 
@@ -112,14 +122,22 @@ async def collect_sources(
         sections.append("")
 
     # ── 3. User-only mode short-circuits the DDGS path. ──────────────────────
+    # We DO enrich the user's links here (unlike the old fast-path) because the
+    # validation table alone (URL + reachability) gives Stage 3/4 nothing to
+    # write about. For a client-grade report built purely from the user's own
+    # authorised sources, we fetch each page's real text and produce grounded,
+    # non-hallucinated per-link summaries that become the curated material.
     if source_mode == SourceMode.USER_LINKS_ONLY:
-        if enrich_with_llm and validation:
+        keep = [r for r in validation if (r.notes or "").lower() != "dropped: unrelated"]
+        if keep and enrich_with_llm:
+            page_texts = await _fetch_page_texts([r.final_url or r.url for r in keep])
             enriched = await _enrich_user_urls(
-                validation=validation, industries=industries, sub_domains=sub_domains,
+                validation=keep, industries=industries, sub_domains=sub_domains,
                 date_from=date_from, date_to=date_to, work_dir=work_dir,
                 mode=mode, config_overrides=config_overrides, cost_callback=cost_callback,
+                page_texts=page_texts,
             )
-            sections.append("## Enriched User Items")
+            sections.append("## 2-D — User-Provided Links (enriched)")
             sections.append(enriched)
             sections.append("")
         return "\n".join(sections), validation, []
@@ -174,10 +192,12 @@ async def collect_sources(
     if source_mode == SourceMode.COMBINED and validation and enrich_with_llm:
         keep = [r for r in validation if (r.notes or "").lower() != "dropped: unrelated"]
         if keep:
+            page_texts = await _fetch_page_texts([r.final_url or r.url for r in keep])
             enriched = await _enrich_user_urls(
                 validation=keep, industries=industries, sub_domains=sub_domains,
                 date_from=date_from, date_to=date_to, work_dir=work_dir,
                 mode=mode, config_overrides=config_overrides, cost_callback=cost_callback,
+                page_texts=page_texts,
             )
             sections.append("## 2-D — User-Provided Links (enriched)")
             sections.append(enriched)
@@ -488,7 +508,26 @@ async def _enrich_user_urls(
     date_from: str, date_to: str, work_dir: str, mode: CmbAgentMode,
     config_overrides: Dict[str, Any],
     cost_callback: Optional[Callable[[Dict[str, Any]], None]],
+    page_texts: Optional[Dict[str, str]] = None,
 ) -> str:
+    # When we have real page text for a link, embed it so the model summarises
+    # the ACTUAL article — not its own prior knowledge. This is the single most
+    # important guard against fabricated facts in an all-user-links report.
+    page_texts = page_texts or {}
+    grounded_blocks: List[str] = []
+    for r in validation:
+        key = r.final_url or r.url
+        body = (page_texts.get(key) or page_texts.get(r.url) or "").strip()
+        if body:
+            grounded_blocks.append(
+                f"### {r.url}\n<<PAGE_TEXT_BEGIN>>\n{body[:6000]}\n<<PAGE_TEXT_END>>"
+            )
+    grounded_section = (
+        "\n\n## Fetched page text (ground truth — summarise ONLY from this)\n"
+        + "\n\n".join(grounded_blocks)
+        if grounded_blocks else ""
+    )
+
     prompt = (
         f"# User-Link Enrichment Pass — {date_from} → {date_to}\n\n"
         f"Industries: {', '.join(industries)}\n"
@@ -496,9 +535,13 @@ async def _enrich_user_urls(
         "For each link in the validation report below, extract: title, source domain, "
         "publication date if visible, category (Product Launch / Research / Partnership / "
         "M&A / Funding / Regulatory / People / Other), and a 3–5 sentence factual summary. "
-        "If the date is not visible from the URL/snippet, mark it `date: not stated in snippet`. "
+        "When fetched page text is provided for a link, base the title, date, category, and "
+        "summary STRICTLY on that text — preserve every concrete number, dollar figure, "
+        "benchmark, model name, and named entity verbatim. Never invent facts not present in "
+        "the page text. If the date is not visible, mark it `date: not stated in snippet`. "
         "Always include the URL with each item. Always produce substantive output.\n\n"
         f"<<VALIDATION_BEGIN>>\n{summarize_validation(validation)}\n<<VALIDATION_END>>\n"
+        f"{grounded_section}"
     )
 
     return await call_llm_with_antirefusal(
@@ -508,3 +551,53 @@ async def _enrich_user_urls(
         ),
         primary_prompt=prompt,
     )
+
+
+async def _fetch_page_texts(urls: List[str], *, max_urls: int = 60) -> Dict[str, str]:
+    """Fetch and crudely strip visible text from each URL (best-effort).
+
+    Returns a ``{url: text}`` map. Failures are silently skipped so a slow or
+    blocked page never aborts source collection — the enrichment pass simply
+    falls back to URL-only summarisation for that link.
+    """
+    import httpx
+
+    urls = [u for u in urls if u][:max_urls]
+    if not urls:
+        return {}
+
+    _tag_re = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+    _html_re = re.compile(r"<[^>]+>")
+    _ws_re = re.compile(r"\n\s*\n\s*\n+")
+
+    def _strip(html: str) -> str:
+        html = _tag_re.sub(" ", html)
+        text = _html_re.sub(" ", html)
+        import html as _htmlmod
+        text = _htmlmod.unescape(text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = _ws_re.sub("\n\n", text)
+        return text.strip()
+
+    sem = asyncio.Semaphore(8)
+    out: Dict[str, str] = {}
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MARS-NewsLetter/0.1)"},
+        follow_redirects=True, http2=False,
+    ) as client:
+        async def _one(u: str) -> None:
+            async with sem:
+                try:
+                    resp = await client.get(u, timeout=15.0)
+                    if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", ""):
+                        body = _strip(resp.text)
+                        if len(body) > 200:
+                            out[u] = body
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("user_url_fetch_failed", url=u, error=str(exc)[:120])
+
+        await asyncio.gather(*(_one(u) for u in urls))
+
+    logger.info("user_url_page_text_fetched", requested=len(urls), fetched=len(out))
+    return out

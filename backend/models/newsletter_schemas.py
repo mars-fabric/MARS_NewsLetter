@@ -25,12 +25,15 @@ class CmbAgentMode(str, Enum):
 
     ``planning_and_control`` is wired to cmbagent's
     ``planning_and_control_context_carryover`` workflow (the variant PaperPulse
-    and NewsPulse use) — i.e. the planner+executor with cross-step memory. We
-    expose only the two-mode surface (``one_shot`` / ``planning_and_control``)
-    in the API and UI for clarity.
+    and NewsPulse use) — i.e. the planner+executor with cross-step memory.
+    ``deep_research`` is cmbagent's multi-step research workflow (planner →
+    reviewer → iterative executor with full context carryover). It is the
+    strongest — and slowest — mode; reserved for Stage-4 ``deep`` sections
+    where the user asked for genuine research-grade depth.
     """
     ONE_SHOT = "one_shot"
     PLANNING_AND_CONTROL = "planning_and_control"
+    DEEP_RESEARCH = "deep_research"
 
 
 class SourceMode(str, Enum):
@@ -119,11 +122,16 @@ class StageModeConfig(BaseModel):
       of this setting.
     * Stage 2 has an explicit ``top_companies_count`` so we discover the top-N
       companies in the chosen industries first, then drill into per-company news.
+
+    NOTE: per-stage *mode* now defaults to ``None`` so the backend ``.env``
+    (``NEWSLETTER_STAGE_{n}_MODE`` / ``NEWSLETTER_DEFAULT_MODE``) is the single
+    source of truth for invocation strategy. The per-stage strategy UI was
+    removed; a value here (if ever supplied) still wins for backward compat.
     """
-    stage_2_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
-    stage_3_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
-    stage_4_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
-    stage_5_mode: CmbAgentMode = Field(default=CmbAgentMode.ONE_SHOT)
+    stage_2_mode: Optional[CmbAgentMode] = Field(default=None)
+    stage_3_mode: Optional[CmbAgentMode] = Field(default=None)
+    stage_4_mode: Optional[CmbAgentMode] = Field(default=None)
+    stage_5_mode: Optional[CmbAgentMode] = Field(default=None)
 
     # Stage-2 specific knobs
     stage_2_top_companies_count: int = Field(default=12, ge=0, le=30, description="Top-N companies to discover via web search before per-company news extraction. 0 disables the company discovery substep.")
@@ -158,7 +166,44 @@ class NewsletterCreateRequest(BaseModel):
     source_mode: SourceMode = Field(default=SourceMode.COMBINED)
     user_urls: List[str] = Field(default_factory=list, description="URLs supplied directly by the user")
 
+    analyze_user_links: bool = Field(
+        default=False,
+        description="When true, the user's own links are first-class analysis targets: they are "
+        "auto-pinned, never skipped/filtered at any stage, and Stage 4 produces a dedicated "
+        "analysis of their content. Use this when the user's organisation has authorised access "
+        "to these sources and wants them analysed rather than merely cited.",
+    )
+
+    executive_grade: bool = Field(
+        default=False,
+        description="When true, Stage 4 auto-elevates the hero sections a CEO/CTO reads first "
+        "(Executive Summary, Top Story, Focus Topic Deep Dive, Trend Intelligence, "
+        "Forward-Looking / Strategic) to a mars_cmbagent deep_research pre-pass for "
+        "research-grade synthesis, without the user marking each section 'deep' in Gate B.",
+    )
+
     audience: Optional[str] = Field(None, description="Free-text audience hint (e.g. 'CXOs at industrial firms')")
+
+    # ── Enhanced Stage-1 input (redesign) ──────────────────────────────────────
+    focus_prompt: Optional[str] = Field(
+        None,
+        description="Free-text description of what the user actually cares about — "
+        "drives Stage 2 discovery queries and Stage 4 analysis emphasis.",
+    )
+    tone: Optional[str] = Field(
+        None,
+        description="Desired editorial tone (e.g. 'analytical', 'executive briefing', 'technical deep-dive').",
+    )
+    pinned_urls: List[str] = Field(
+        default_factory=list,
+        description="URLs the user trusts and wants preserved end-to-end. These bypass "
+        "the Stage-3 drop filter and are always cited if relevant.",
+    )
+    shape_hint: Optional[str] = Field(
+        None,
+        description="Free-text hint about the desired newsletter shape/structure, used as the "
+        "default when the user does not supply an explicit Stage-4 section template.",
+    )
 
     mode_config: StageModeConfig = Field(default_factory=StageModeConfig)
 
@@ -181,6 +226,19 @@ class NewsletterCreateRequest(BaseModel):
                 continue
             if not (url.startswith("http://") or url.startswith("https://")):
                 raise ValueError(f"URL must start with http:// or https://: {url}")
+            cleaned.append(url)
+        return cleaned
+
+    @field_validator("pinned_urls")
+    @classmethod
+    def _pinned_urls_basic(cls, v: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for url in v:
+            url = (url or "").strip()
+            if not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                raise ValueError(f"Pinned URL must start with http:// or https://: {url}")
             cleaned.append(url)
         return cleaned
 
@@ -221,6 +279,106 @@ class NewsletterContentUpdateRequest(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Gate A — Link prioritization (between Stage 2 and Stage 3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LinkAction(str, Enum):
+    """User decision on a discovered source link before curation."""
+    PIN = "pin"          # must survive curation and be cited if relevant
+    BOOST = "boost"      # rank higher during curation
+    NORMAL = "normal"    # default treatment
+    EXCLUDE = "exclude"  # drop before curation
+
+
+class LinkPriority(BaseModel):
+    """A single user decision applied to one discovered link."""
+    url: str = Field(..., description="The source URL this decision applies to")
+    action: LinkAction = Field(default=LinkAction.NORMAL)
+    weight: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="Optional explicit relevance weight (0-1) overriding the discovered score.",
+    )
+
+
+class LinkPrioritiesRequest(BaseModel):
+    """POST /api/newsletter/{task_id}/gate/links — user link prioritization (Gate A).
+
+    Applied to the Stage-2 verified source list before Stage 3 curation runs.
+    """
+    priorities: List[LinkPriority] = Field(default_factory=list)
+    add_urls: List[str] = Field(
+        default_factory=list,
+        description="Extra URLs the user wants injected (auto-pinned + fetch-verified).",
+    )
+    min_relevance: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="Curation drop threshold override. Lower keeps more sources (relaxes over-filtering).",
+    )
+
+    @field_validator("add_urls")
+    @classmethod
+    def _add_urls_basic(cls, v: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for url in v:
+            url = (url or "").strip()
+            if not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                raise ValueError(f"URL must start with http:// or https://: {url}")
+            cleaned.append(url)
+        return cleaned
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gate B — Section template selection (between Stage 3 and Stage 4)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SectionDepth(str, Enum):
+    """How much analytical effort Stage 4 spends on a section."""
+    LIGHT = "light"        # one_shot summary (~180 words)
+    STANDARD = "standard"  # one_shot with structured analysis (~340 words)
+    DEEP = "deep"          # cmbagent deep_research multi-step analysis (~650 words)
+
+
+class SectionSpecRequest(BaseModel):
+    """A single user-chosen report section (Gate B)."""
+    title: str = Field(..., description="Section heading as it should appear in the report")
+    depth: SectionDepth = Field(default=SectionDepth.STANDARD)
+    points: Optional[int] = Field(
+        None, ge=1, le=20,
+        description="How many distinct key points/items this section should cover "
+        "(e.g. 5 trends). Each point is expanded to the requested depth.",
+    )
+    guidance: Optional[str] = Field(
+        None, description="Free-text instructions for what this section should analyse/cover.",
+    )
+    word_count: Optional[int] = Field(
+        None, ge=50, le=2000,
+        description="Custom word-count target for this section. Overrides the depth-derived "
+        "budget when provided (use alongside depth='standard' for precise control).",
+    )
+
+
+class ReportTemplateRequest(BaseModel):
+    """POST /api/newsletter/{task_id}/gate/template — user report template (Gate B).
+
+    Replaces the fixed 22 canonical sections. Applied before Stage 4 generation.
+    """
+    sections: List[SectionSpecRequest] = Field(
+        ..., description="Ordered list of sections the user wants generated.",
+    )
+    tone: Optional[str] = Field(None, description="Override editorial tone for this report.")
+    audience: Optional[str] = Field(None, description="Override audience for this report.")
+
+    @field_validator("sections")
+    @classmethod
+    def _at_least_one_section(cls, v: List[SectionSpecRequest]) -> List[SectionSpecRequest]:
+        if not v:
+            raise ValueError("At least one section is required")
+        return v
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Responses
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -252,18 +410,6 @@ class LinkValidationResult(BaseModel):
     notes: Optional[str] = None
 
 
-class ScoreCard(BaseModel):
-    """Stage 5 authenticity scorecard — sent to UI alongside final markdown."""
-    authenticity_score: int = Field(..., ge=0, le=100, description="0-100 authenticity rating")
-    verdict: str = Field(..., description="Short verdict: 'production-ready' | 'needs-revision' | 'reject'")
-    suggestions: List[str] = Field(default_factory=list, description="Concrete final suggestions for improvement")
-    coverage_score: Optional[int] = Field(None, ge=0, le=100)
-    citation_score: Optional[int] = Field(None, ge=0, le=100)
-    factual_fidelity_score: Optional[int] = Field(None, ge=0, le=100)
-    structural_completeness_score: Optional[int] = Field(None, ge=0, le=100)
-    notes: Optional[str] = None
-
-
 class StageContentResponse(BaseModel):
     stage_number: int
     stage_name: str
@@ -272,7 +418,6 @@ class StageContentResponse(BaseModel):
     shared_state: Optional[Dict[str, Any]] = None
     output_files: Optional[List[str]] = None
     link_validation: Optional[List[LinkValidationResult]] = None
-    score_card: Optional[ScoreCard] = None
 
 
 class NewsletterTaskStateResponse(BaseModel):

@@ -111,6 +111,34 @@ def _placeholder(spec: SectionSpec) -> str:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Link whitelist helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_whitelist_urls(text: str) -> set:
+    """Return the set of normalised URLs present in the curated markdown."""
+    urls = set(re.findall(r"https?://[^\s)\"'<>]+", text or ""))
+    return {u.rstrip(".,;:!?'\"]>") for u in urls}
+
+
+def _enforce_link_whitelist(section_md: str, whitelist: set) -> str:
+    """Replace [text](url) links whose URL is not in the curated whitelist
+    with just the link text, preventing hallucinated citations from reaching
+    the final report.
+    """
+    if not whitelist:
+        return section_md
+
+    def _sub(m: re.Match) -> str:
+        text, url = m.group(1), m.group(2)
+        clean_url = url.rstrip(".,;:!?'\"]>")
+        if clean_url in whitelist:
+            return m.group(0)
+        return text  # drop the link, keep visible text
+
+    return re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s\n]+)\)", _sub, section_md)
+
+
 def _trim_trailing_broken_link(section_md: str) -> str:
     """Strip any half-written markdown link at the very end of a section.
 
@@ -163,12 +191,14 @@ async def _draft_section(
     prior_tail: str,
     today: str,
     cost_events: List[Dict[str, Any]],
+    total_sections: int = 22,
 ) -> str:
     """Draft a single section. Retries once if the heading is wrong."""
     prompt = build_section_prompt(
         spec=spec, outline=outline, curated=curated, setup=setup,
         industries=industries, sub_domains=sub_domains, user_urls=user_urls,
         prior_sections_tail=prior_tail, today=today,
+        total_sections=total_sections,
     )
     max_tokens = section_max_tokens(spec)
     messages = [
@@ -263,6 +293,140 @@ def _user_url_coverage(*, work_dir: str, draft: str, setup_user_urls: List[str])
     }
 
 
+def _build_section_specs(setup: Dict[str, Any]) -> Tuple[List[SectionSpec], Dict[int, str]]:
+    """Return section specs to draft + a depth map keyed by section number.
+
+    When the user supplied a Gate-B ``report_template`` we build dynamic specs
+    from it (title + per-section depth + guidance). Otherwise fall back to the
+    canonical 22-section layout. Depth controls the per-section token budget and
+    whether Stage 4 runs a cmbagent deep_research pre-pass for the section.
+    """
+    template = setup.get("report_template") or []
+    if not template:
+        return CANONICAL_SECTIONS, {s.number: "standard" for s in CANONICAL_SECTIONS}
+
+    _WORDS = {"light": 180, "standard": 340, "deep": 650}
+    specs: List[SectionSpec] = []
+    depth_by_num: Dict[int, str] = {}
+    for idx, item in enumerate(template, start=1):
+        title = (item.get("title") or f"Section {idx}").strip()
+        depth = (item.get("depth") or "standard").lower()
+        if depth not in _WORDS:
+            depth = "standard"
+        points = item.get("points")
+        try:
+            points = int(points) if points is not None else None
+        except (TypeError, ValueError):
+            points = None
+        guidance = (item.get("guidance") or "").strip()
+
+        # word_count override: user specified an explicit word target (e.g. via
+        # "Custom" length button in Gate B). It takes priority over depth-derived
+        # budget but does not change the depth label (so "deep" still triggers
+        # the cmbagent deep_research pre-pass regardless of word_count).
+        custom_word_count = item.get("word_count")
+        try:
+            custom_word_count = int(custom_word_count) if custom_word_count is not None else None
+        except (TypeError, ValueError):
+            custom_word_count = None
+
+        # When the user asked for N distinct points, mandate exactly that count
+        # and expand the word budget so each point gets full treatment at the
+        # requested depth (e.g. "5 trends, each deeply researched").
+        per_point_words = _WORDS[depth]
+        base_words = custom_word_count if custom_word_count else _WORDS[depth]
+        if points:
+            guidance += (
+                f" Cover exactly {points} distinct, clearly-numbered key points. "
+                f"Each point is a self-contained mini-analysis."
+            )
+            # Points multiply the per-point depth budget; custom_word_count is
+            # ignored when explicit point count is supplied (it controls total
+            # length via multiplied budget).
+            base_words = per_point_words * points
+
+        if depth == "deep":
+            guidance += (
+                " Produce a thorough, multi-angle analysis: context, key "
+                "developments, comparative/competitive view, implications, and "
+                "outlook. Every factual claim ends with an inline [domain](url) "
+                "citation drawn only from the curated allow-list."
+            )
+        else:
+            guidance += (
+                " Every factual claim ends with an inline [domain](url) citation "
+                "drawn only from the curated allow-list."
+            )
+        specs.append(SectionSpec(
+            number=idx, heading=title, guidance=guidance.strip(),
+            target_words=base_words,
+        ))
+        depth_by_num[idx] = depth
+    return specs, depth_by_num
+
+
+async def _deep_research_brief(
+    *,
+    spec: SectionSpec,
+    curated: str,
+    setup: Dict[str, Any],
+    industries: List[str],
+    sub_domains: List[str],
+    work_dir: str,
+    merged: Dict[str, Any],
+    cost_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> str:
+    """Build an analytical brief for a ``deep`` section using cmbagent's
+    ``deep_research`` workflow (multi-step planner → reviewer → iterative
+    executor with context carryover).
+
+    This is the strongest — and slowest — cmbagent mode; it is the right tool
+    for a section the user explicitly flagged as needing research-grade depth
+    (e.g. "5 trends, each deeply understood"). On any failure the dispatcher
+    degrades to one_shot, and a total failure here returns an empty brief so
+    the section still drafts from the curated set alone.
+    """
+    brief_prompt = (
+        f"You are producing an in-depth, research-grade analytical brief for the "
+        f"newsletter section titled '{spec.heading}'.\n\n"
+        f"Industries: {', '.join(industries)}\n"
+        f"Sub-domains: {', '.join(sub_domains)}\n"
+        f"Coverage window: {setup.get('date_from')} → {setup.get('date_to')}\n\n"
+        f"Section guidance: {spec.guidance}\n\n"
+        f"Research the topic thoroughly. You MAY use web search to corroborate "
+        f"and enrich the curated material, but every URL you cite must resolve "
+        f"to a real, reachable page. Prefer the curated sources below; preserve "
+        f"their exact [text](url) citations. Synthesise the key facts, "
+        f"comparisons, implications, and outlook into a structured brief.\n\n"
+        f"### Curated sources\n{curated[:12000]}"
+    )
+    # Give deep research a modest multi-step budget. cmbagent defaults to
+    # max_plan_steps=3 which is plenty for a single section brief.
+    dr_overrides = dict(merged)
+    dr_overrides.setdefault("max_plan_steps", 3)
+    dr_overrides.setdefault("n_plan_reviews", 1)
+    try:
+        brief = await call_llm_with_antirefusal(
+            lambda p: run_ai_stage(
+                prompt=p, mode=CmbAgentMode.DEEP_RESEARCH,
+                work_dir=work_dir, agent="researcher",
+                config_overrides=dr_overrides,
+                cost_callback=cost_callback,
+                researcher_instructions=(
+                    "Produce a focused, well-structured analytical brief for the "
+                    "section. Keep every citation intact and verify links resolve. "
+                    "Do not write the final section prose — provide the research "
+                    "synthesis the writer will build from."
+                ),
+            ),
+            primary_prompt=brief_prompt,
+        )
+        return brief or ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stage4_deep_brief_failed", section=spec.number, error=str(exc)[:200])
+        return ""
+
+
 async def run_stage_4_sectioned(
     *,
     work_dir: str,
@@ -287,6 +451,68 @@ async def run_stage_4_sectioned(
         sub_domains.extend(i.get("sub_domains", []))
     user_urls = [u for u in (setup.get("user_urls") or []) if u]
 
+    # Gate B — user-selected section template (title + depth + guidance). When
+    # absent, ``_build_section_specs`` returns the canonical 22-section layout.
+    section_specs, depth_by_num = _build_section_specs(setup)
+    using_template = bool(setup.get("report_template"))
+
+    # Executive-grade mode — auto-elevate the "hero" sections that a CEO/CTO
+    # reads first to a cmbagent deep_research pre-pass, without the user having
+    # to mark each one "deep" in Gate B. This is where mars_cmbagent's
+    # multi-step planner→reviewer→executor earns its keep: the hero sections
+    # get research-grade synthesis (context, comparison, implications, outlook)
+    # while the routine sections stay fast/cheap. Non-hero sections are
+    # untouched, so total runtime stays bounded.
+    if setup.get("executive_grade"):
+        _HERO_KEYWORDS = (
+            "executive summary", "top story", "focus topic", "deep dive",
+            "trend intelligence", "forward-looking", "strategic",
+        )
+        elevated: List[str] = []
+        for spec in section_specs:
+            h = spec.heading.lower()
+            if depth_by_num.get(spec.number) != "deep" and any(k in h for k in _HERO_KEYWORDS):
+                depth_by_num[spec.number] = "deep"
+                elevated.append(spec.heading)
+        if elevated:
+            logger.info("stage4_executive_grade_elevated", sections=elevated)
+
+    # When the user asked to analyse their own links, prepend a dedicated,
+    # deep analysis section built exclusively from those URLs so their content
+    # is always front-and-centre and never merely cited in passing.
+    if setup.get("analyze_user_links") and user_urls:
+        renum: List[SectionSpec] = []
+        new_depth: Dict[int, str] = {}
+        user_spec = SectionSpec(
+            number=1,
+            heading="Analysis of Your Provided Sources",
+            guidance=(
+                "Deeply analyse the user's own provided sources listed below. "
+                "Summarise each source's key content, extract the most important "
+                "findings, connect them to the broader industry context, and cite "
+                "each with its exact [text](url) link. These are authorised, "
+                "must-cover sources — never omit any of them.\n\nUser sources:\n"
+                + "\n".join(f"- {u}" for u in user_urls)
+            ),
+            target_words=max(400, 220 * min(len(user_urls), 6)),
+        )
+        renum.append(user_spec)
+        new_depth[1] = "deep"
+        for i, spec in enumerate(section_specs, start=2):
+            renum.append(SectionSpec(
+                number=i, heading=spec.heading, guidance=spec.guidance,
+                target_words=spec.target_words,
+            ))
+            new_depth[i] = depth_by_num.get(spec.number, "standard")
+        section_specs, depth_by_num = renum, new_depth
+        using_template = True
+
+    # Template-level tone / audience overrides (Gate B).
+    if setup.get("template_audience") or setup.get("template_tone"):
+        setup = dict(setup)
+        if setup.get("template_audience"):
+            setup["audience"] = setup["template_audience"]
+
     mode = _stage_mode(setup, 4, mode_override)
     merged = merge_overrides(setup, 4, config_overrides)
     # Analyst step is a pure content-transformation pass — force single-step
@@ -298,26 +524,47 @@ async def run_stage_4_sectioned(
     today = _today()
     cost_events: List[Dict[str, Any]] = []
 
+    # Pre-build the URL whitelist from the curated material so section writers
+    # can only cite URLs that were actually verified in Stage 3.
+    url_whitelist = _extract_whitelist_urls(curated)
+
     # ── Step 1: analyst outline (cmbagent — same as legacy path) ──────────
+    section_headings = [s.heading for s in section_specs]
     analyst_prompt = generation_analyst_prompt(
         curated=curated, industries=industries, sub_domains=sub_domains,
         date_from=setup["date_from"], date_to=setup["date_to"],
         audience=setup.get("audience"), title=setup.get("title"),
         user_urls=user_urls, seed_companies=seed_companies,
+        section_headings=section_headings,
     )
     analyst_instructions = (
         "Build the analytical outline. Identify 5–8 themes, pick the Top Story / "
         "Secondary Story, list opportunities and risks, propose a Focus Topic "
-        "Deep Dive, and emit the 22-section ordered list verbatim."
+        "Deep Dive, and emit the section list verbatim. "
+        "Work ONLY from the curated material — do not run web searches."
     )
+    if using_template:
+        analyst_instructions = (
+            "Build an analytical outline for the report. Identify the key themes, "
+            "the most significant developments, opportunities, and risks across "
+            "the coverage window, so the writer can populate the user-defined "
+            "sections: " + "; ".join(s.heading for s in section_specs) + ". "
+            "Work ONLY from the curated material — do not run web searches."
+        )
+
+    # Cap analyst at max_rounds=5 — it is a pure content-transformation task
+    # (synthesise themes from curated text), not a multi-step research task.
+    analyst_overrides = dict(analyst_merged)
+    analyst_overrides.setdefault("max_rounds", 5)
 
     if mode == CmbAgentMode.PLANNING_AND_CONTROL:
         outline = await call_llm_with_antirefusal(
             lambda p: run_ai_stage(
                 prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=analyst_merged, cost_callback=cost_callback,
+                config_overrides=analyst_overrides, cost_callback=cost_callback,
                 plan_instructions=_RESEARCHER_ONLY_PLAN_INSTRUCTIONS,
                 researcher_instructions=analyst_instructions,
+                allow_web_tools=False,
             ),
             primary_prompt=analyst_prompt,
         )
@@ -325,7 +572,8 @@ async def run_stage_4_sectioned(
         outline = await call_llm_with_antirefusal(
             lambda p: run_ai_stage(
                 prompt=p, mode=mode, work_dir=work_dir, agent="researcher",
-                config_overrides=merged, cost_callback=cost_callback,
+                config_overrides=analyst_overrides, cost_callback=cost_callback,
+                allow_web_tools=False,
             ),
             primary_prompt=analyst_prompt,
         )
@@ -345,13 +593,29 @@ async def run_stage_4_sectioned(
     written_sections: List[str] = []
     accumulated = ""
 
-    for spec in CANONICAL_SECTIONS:
+    total_sections = len(section_specs)
+    for spec in section_specs:
         prior_tail = accumulated[-2000:] if accumulated else ""
+        # Deep sections get a cmbagent deep_research analytical brief that we
+        # fold into the outline context handed to the section writer.
+        section_outline = outline
+        if depth_by_num.get(spec.number) == "deep":
+            brief = await _deep_research_brief(
+                spec=spec, curated=curated, setup=setup,
+                industries=industries, sub_domains=sub_domains,
+                work_dir=work_dir, merged=merged, cost_callback=cost_callback,
+            )
+            if brief:
+                section_outline = f"{outline}\n\n### Deep-research brief for this section\n{brief}"
         section_md = await _draft_section(
-            spec=spec, outline=outline, curated=curated, setup=setup,
+            spec=spec, outline=section_outline, curated=curated, setup=setup,
             industries=industries, sub_domains=sub_domains, user_urls=user_urls,
             prior_tail=prior_tail, today=today, cost_events=cost_events,
+            total_sections=total_sections,
         )
+        # Enforce the curated URL whitelist — strip any link whose URL was not
+        # present in Stage-3 curated.md to eliminate hallucinated citations.
+        section_md = _enforce_link_whitelist(section_md, url_whitelist)
         written_sections.append(section_md)
         accumulated += "\n\n" + section_md.strip()
         logger.info(
@@ -376,7 +640,25 @@ async def run_stage_4_sectioned(
     coverage = _user_url_coverage(
         work_dir=work_dir, draft=draft, setup_user_urls=user_urls,
     )
-    files = [outline_path, draft_path]
+
+    # Persist the section structure so Stage 5 and the UI can inspect which
+    # sections were written and with what depth/word budget.
+    structure_data = {
+        "sections": [
+            {
+                "number": s.number,
+                "heading": s.heading,
+                "depth": depth_by_num.get(s.number, "standard"),
+                "target_words": s.target_words,
+            }
+            for s in section_specs
+        ],
+        "using_template": using_template,
+        "total_sections": total_sections,
+    }
+    structure_path = _write(work_dir, 4, "report_structure.json", json.dumps(structure_data, indent=2))
+
+    files = [outline_path, draft_path, structure_path]
     if coverage:
         notes_path = _write(work_dir, 4, "source_coverage.json", json.dumps(coverage, indent=2, default=str))
         files.append(notes_path)
@@ -403,9 +685,9 @@ async def run_stage_4_sectioned(
             "outline": outline,
             "stage4_source_coverage": coverage,
             "stage4_section_completion": {
-                "filled_sections": [s.number for s in CANONICAL_SECTIONS],
+                "filled_sections": [s.number for s in section_specs],
                 "still_missing": [],
-                "mode": "sectioned",
+                "mode": "template" if using_template else "sectioned",
                 "duration_s": duration,
                 "draft_chars": len(draft),
             },

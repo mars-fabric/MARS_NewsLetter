@@ -1,16 +1,17 @@
-"""Stage 5 — LangGraph-based Report Builder, Evaluator, and Dashboard.
+"""Stage 5 support package.
 
-This package replaces the legacy ``cmbagent``-driven critic/editor/score-card
-flow in ``helpers.run_stage_5`` with a 22-node LangGraph DAG. The runner is
-signature-compatible so the orchestrator can switch implementations behind a
-flag.
+The legacy 22-node LangGraph review/score-card flow that used to live here has
+been removed. The active Stage-5 render pipeline now lives in
+:mod:`task_framework.newsletter.stage5_report`.
 
-Public surface:
-    run_stage_5_langgraph  — async entry point matching helpers.run_stage_5
-    build_stage5_graph     — compile a fresh graph (e.g. for visualization)
+Only the shared litellm wrapper survives in this package because Stage 4 and
+Stage 5 both import it:
+
+    from ..stage5.llm_client import acomplete, default_model
 """
 
-from .graph import build_stage5_graph
-from .runner import run_stage_5_langgraph
+from __future__ import annotations
 
-__all__ = ["run_stage_5_langgraph", "build_stage5_graph"]
+from .llm_client import acomplete, acomplete_json, default_model
+
+__all__ = ["acomplete", "acomplete_json", "default_model"]

@@ -98,8 +98,65 @@ export interface NewsletterCreateRequest {
   source_mode: SourceMode;
   user_urls: string[];
   audience?: string | null;
-  mode_config: StageModeConfig;
+  // When true, the user's own links are first-class analysis targets:
+  // auto-pinned, never skipped, and given a dedicated Stage-4 analysis section.
+  analyze_user_links?: boolean;
+  // When true, Stage 4 auto-elevates the hero sections to a mars_cmbagent
+  // deep-research pre-pass for research-grade, CEO/CTO-quality synthesis.
+  executive_grade?: boolean;
+  // Enhanced Stage-1 input (redesign)
+  focus_prompt?: string | null;
+  tone?: string | null;
+  pinned_urls?: string[];
+  shape_hint?: string | null;
+  // Per-stage agent strategy was removed from the UI; invocation mode/models
+  // now come from the backend .env. Left optional for backward compatibility.
+  mode_config?: StageModeConfig;
   work_dir?: string | null;
+}
+
+// ── Gate A — link prioritization (between Stage 2 and Stage 3) ──────────────
+export type LinkAction = 'pin' | 'boost' | 'normal' | 'exclude';
+
+export interface LinkPriority {
+  url: string;
+  action: LinkAction;
+  weight?: number | null;
+}
+
+export interface LinkPrioritiesRequest {
+  priorities: LinkPriority[];
+  add_urls: string[];
+  min_relevance?: number | null;
+}
+
+// ── Gate B — section template (between Stage 3 and Stage 4) ─────────────────
+export type SectionDepth = 'light' | 'standard' | 'deep';
+
+export interface SectionSpecRequest {
+  title: string;
+  depth: SectionDepth;
+  // How many distinct key points/items to cover (e.g. 5 trends).
+  points?: number | null;
+  guidance?: string | null;
+  // Custom word-count target. Overrides the depth-derived budget.
+  // Used when the user selects the "Custom" length option in Gate B.
+  word_count?: number | null;
+}
+
+export interface ReportTemplateRequest {
+  sections: SectionSpecRequest[];
+  tone?: string | null;
+  audience?: string | null;
+}
+
+export interface GateState {
+  link_priorities: LinkPriority[];
+  excluded_urls: string[];
+  min_relevance?: number | null;
+  report_template: SectionSpecRequest[];
+  template_tone?: string | null;
+  template_audience?: string | null;
 }
 
 export interface StageInfo {
@@ -131,17 +188,6 @@ export interface LinkValidationResult {
   notes?: string | null;
 }
 
-export interface ScoreCard {
-  authenticity_score: number;
-  verdict: 'production-ready' | 'needs-revision' | 'reject';
-  citation_score?: number | null;
-  factual_fidelity_score?: number | null;
-  coverage_score?: number | null;
-  structural_completeness_score?: number | null;
-  suggestions: string[];
-  notes?: string | null;
-}
-
 export interface StageContent {
   stage_number: number;
   stage_name: string;
@@ -150,7 +196,6 @@ export interface StageContent {
   shared_state?: Record<string, unknown> | null;
   output_files?: string[] | null;
   link_validation?: LinkValidationResult[] | null;
-  score_card?: ScoreCard | null;
 }
 
 export interface TaskState {
@@ -180,7 +225,7 @@ export const STAGE_NAMES: Record<number, string> = {
   2: 'Source Collection',
   3: 'Curation',
   4: 'Generation',
-  5: 'Review & Publish',
+  5: 'Report Builder',
 };
 
 export const STAGE_DESCRIPTIONS: Record<number, string> = {
@@ -188,7 +233,7 @@ export const STAGE_DESCRIPTIONS: Record<number, string> = {
   2: 'Discover top-N companies, extract per-company news, and run industry-wide search (≥30 sources).',
   3: 'Deduplicate by story, group by sub-domain and company, tag categories and Top: yes/no.',
   4: 'Analyst outlines themes, writer drafts the 22-section professional newsletter (≥3500 words).',
-  5: 'Critic finds issues, editor finalises, programmatic checks run, score card emitted, PDF rendered.',
+  5: 'Break the draft into a structured JSON document, enhance each section, validate every link, render HTML + PDF.',
 };
 
 /**

@@ -632,10 +632,29 @@ def generation_analyst_prompt(
     title: Optional[str] = None,
     user_urls: Optional[List[str]] = None,
     seed_companies: Optional[List[Dict[str, str]]] = None,
+    section_headings: Optional[List[str]] = None,
 ) -> str:
     aud = audience or "general business / industry stakeholders"
     title_lbl = title or "(auto-generate from industry + sub-domain)"
     seed_lbl = ", ".join(c.get("name", "?") for c in (seed_companies or [])) or "(none — derive from curated set)"
+
+    # Truncate curated to 6 000 chars so the analyst prompt stays well within
+    # context and avoids the 3-hour runs caused by 80–150 KB payloads.
+    curated_excerpt = curated[:6000]
+    if len(curated) > 6000:
+        curated_excerpt += "\n\n... [curated material truncated — full set available to the section writer]"
+
+    # Section list: use the user's chosen headings (Gate B) when available,
+    # otherwise fall back to the 22 canonical headings.
+    if section_headings:
+        section_list_lines = [f"   - {h}" for h in section_headings]
+        section_count = len(section_headings)
+        section_source = "user-defined"
+    else:
+        from ..stage4.sections import canonical_headings
+        section_list_lines = [f"   - {h}" for h in canonical_headings()]
+        section_count = 22
+        section_source = "canonical"
 
     return _join([
         f"# Newsletter Analyst — {date_from} → {date_to}",
@@ -647,16 +666,20 @@ def generation_analyst_prompt(
         f"- Top companies in scope: {seed_lbl}",
         "Tone: professional, neutral, authoritative, implication-led.",
         "",
-        "## Curated material (ground truth)",
+        "## IMPORTANT — scope of this task",
+        "You are a **content analyst**, not a researcher. Work ONLY from the curated material below.",
+        "Do NOT run web searches, call DDGS, or fetch any URLs — all the evidence you need is here.",
+        "",
+        "## Curated material (ground truth — excerpt)",
         "<<CURATED_BEGIN>>",
-        curated,
+        curated_excerpt,
         "<<CURATED_END>>",
         "",
         "## Your task",
         "1. Identify **5–8 themes** that connect the curated items. For each theme:",
         "   - `Title` (≤ 8 words)",
         "   - `Framing` (one paragraph: what it is, why it matters now, who is affected)",
-        "   - `Supporting items` (cite by title + URL, ≥ 3 items)",
+        "   - `Supporting items` (cite by title + URL, ≥ 3 items from the curated set above)",
         "   - `So-what` line: implication for the audience",
         "",
         "2. Pick the **Top Story** and **Secondary Story** for the period, with a one-line rationale each.",
@@ -667,12 +690,12 @@ def generation_analyst_prompt(
         "",
         "5. Suggest a **Focus Topic Deep Dive** (one specific topic that warrants extended treatment).",
         "",
-        "6. **Coverage map (mandatory).** Enumerate EVERY curated item that is either `Top: yes` OR has `Relevance >= 8`, and for each one name the canonical section (from the 22-section list below) where it will appear. Do not leave a high-relevance item unassigned — if it does not fit anywhere obvious, place it in `Other Notable Headlines`. This is the single most common gap flagged by Stage-5 scoring: a curated item scored 9/9/9 by the curator but never mentioned by the writer.",
+        f"6. **Coverage map (mandatory).** Enumerate EVERY curated item that is either `Top: yes` OR has `Relevance >= 8`, and for each one name the section (from the {section_count} {section_source} sections below) where it will appear. Do not leave a high-relevance item unassigned.",
         "",
-        "7. Propose the section order for the final newsletter using the canonical section list:",
+        f"7. Propose the section order for the final newsletter using the {section_count} {section_source} sections:",
         "",
         "```",
-        *(f"   - {s}" for s in NEWSLETTER_SECTION_LIST),
+        *section_list_lines,
         "```",
         "",
         "## Output (markdown)",

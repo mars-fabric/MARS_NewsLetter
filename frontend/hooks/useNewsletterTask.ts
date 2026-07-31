@@ -6,7 +6,10 @@ import { getApiUrl, getWsUrl } from '@/lib/config';
 import { apiJson } from '@/lib/fetchWithRetry';
 import {
   CreateResponse,
+  GateState,
+  LinkPrioritiesRequest,
   NewsletterCreateRequest,
+  ReportTemplateRequest,
   StageContent,
   TaskState,
 } from '@/types/newsletter';
@@ -330,6 +333,41 @@ export function useNewsletterTask() {
     }
   }, [setError]);
 
+  // ── Gates (Gate A: link priorities, Gate B: section template) ─────────────
+
+  const getGateState = useCallback(async (taskId: string) => {
+    try {
+      return await apiJson<GateState>(`/api/newsletter/${taskId}/gate`);
+    } catch (err) {
+      setError(err);
+      return null;
+    }
+  }, [setError]);
+
+  const setLinkPriorities = useCallback(async (taskId: string, req: LinkPrioritiesRequest) => {
+    try {
+      await apiJson(`/api/newsletter/${taskId}/gate/links`, {
+        method: 'POST', body: JSON.stringify(req),
+      });
+      return true;
+    } catch (err) {
+      setError(err);
+      return false;
+    }
+  }, [setError]);
+
+  const setReportTemplate = useCallback(async (taskId: string, req: ReportTemplateRequest) => {
+    try {
+      await apiJson(`/api/newsletter/${taskId}/gate/template`, {
+        method: 'POST', body: JSON.stringify(req),
+      });
+      return true;
+    } catch (err) {
+      setError(err);
+      return false;
+    }
+  }, [setError]);
+
   useEffect(() => () => stopStreams(), [stopStreams]);
 
   return {
@@ -342,6 +380,9 @@ export function useNewsletterTask() {
     executeStage,
     updateStageContent,
     regeneratePdf,
+    getGateState,
+    setLinkPriorities,
+    setReportTemplate,
     openWs,
     closeWs,
   };
